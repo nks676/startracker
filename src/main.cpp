@@ -6,7 +6,5 @@ int main() {
 
     ImageData orion = fits_to_data(filename);
 
-    std::cout << "Image Width: " << orion.width << ", Height: " << orion.height << std::endl;
-
     return 0;
 }
