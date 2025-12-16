@@ -44,19 +44,19 @@ ImageData fits_to_data(const std::string& filename) {
     }
 
     // mean
-    data.intensity_mean = 0.0;
+    double sum = 0.0;
     for (double val: data.pixels) {
-        data.intensity_mean += val;
+        sum += val;
     }
-    data.intensity_mean = data.intensity_mean / num_pixels;
+    data.intensity_mean = sum / num_pixels;
 
     // standard deviation
-    data.intensity_standard_deviation = 0.0;
+    double sum_of_diff = 0.0;
     for (double val: data.pixels) {
-        data.intensity_standard_deviation += (val - data.intensity_mean) * (val - data.intensity_mean);
+        sum_of_diff += (val - data.intensity_mean) * (val - data.intensity_mean);
     }
-    data.intensity_standard_deviation = sqrt(data.intensity_standard_deviation / num_pixels);
-
+    data.intensity_standard_deviation = sqrt(sum_of_diff / num_pixels);
+    
     // threshold and mask
     data.intensity_threshold = data.intensity_mean + THRESHOLD_CONSTANT * data.intensity_standard_deviation;
     data.pixels_mask.resize(num_pixels);
@@ -114,6 +114,25 @@ ImageData fits_to_data(const std::string& filename) {
             long x = i % data.width;
             long y = i / data.width;
             data.clusters[cluster_idx].pixels.push_back(Pixel{x, y, data.pixels[i]});
+        }
+    }
+
+    // compute centroids and total intensities
+    for (Cluster& cluster : data.clusters) {
+        double sum_x = 0.0;
+        double sum_y = 0.0;
+        double sum_intensity = 0.0;
+
+        for (const Pixel& pixel : cluster.pixels) {
+            sum_x += pixel.x * pixel.intensity;
+            sum_y += pixel.y * pixel.intensity;
+            sum_intensity += pixel.intensity;
+        }
+
+        if (sum_intensity > 0) {
+            cluster.x_centroid = sum_x / sum_intensity;
+            cluster.y_centroid = sum_y / sum_intensity;
+            cluster.total_intensity = sum_intensity;
         }
     }
 

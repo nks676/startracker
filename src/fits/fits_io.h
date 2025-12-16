@@ -5,21 +5,22 @@
 
 #define THRESHOLD_CONSTANT 5.0
 
-struct Pixel
-{
+struct Pixel {
     long x;
     long y;
     double intensity;
 };
 
-struct Cluster
-{
+struct Cluster {
     int id;
     std::vector<Pixel> pixels;
+
+    double x_centroid;
+    double y_centroid;
+    double total_intensity;
 };
 
-struct ImageData
-{
+struct ImageData {
     std::vector<double> pixels;
     long width;
     long height;
@@ -33,8 +34,7 @@ struct ImageData
     std::vector<Cluster> clusters;
 };
 
-struct UnionFind
-{
+struct UnionFind{
     std::vector<int> parent;
     
     UnionFind(int size) : parent(size) {
