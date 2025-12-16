@@ -1,2 +1,7 @@
 app
 cexamples/
+data/*
+*.o
+*.exe
+*.log
+*.tmp
