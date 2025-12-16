@@ -3,6 +3,8 @@
 #include <vector>
 #include <string>
 
+#define THRESHOLD_CONSTANT 5.0
+
 struct Pixel
 {
     long x;

@@ -58,8 +58,7 @@ ImageData fits_to_data(const std::string& filename) {
     data.intensity_standard_deviation = sqrt(data.intensity_standard_deviation / num_pixels);
 
     // threshold and mask
-    double threshold_constant = 5.0;
-    data.intensity_threshold = data.intensity_mean + threshold_constant * data.intensity_standard_deviation;
+    data.intensity_threshold = data.intensity_mean + THRESHOLD_CONSTANT * data.intensity_standard_deviation;
     data.pixels_mask.resize(num_pixels);
     for (long i = 0; i < num_pixels; i++) {
         data.pixels_mask[i] = (data.pixels[i] >= data.intensity_threshold);
