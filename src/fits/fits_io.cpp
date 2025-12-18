@@ -1,7 +1,9 @@
 #include <iostream>
-#include "fits_io.h"
 #include <map>
 #include <cmath>
+#include <algorithm>
+
+#include "fits_io.h"
 #include "fitsio.h" // CFITSIO
 
 ImageData fits_to_data(const std::string& filename) {
@@ -43,22 +45,29 @@ ImageData fits_to_data(const std::string& filename) {
         return data;
     }
 
-    // mean
+    // mean, stddev, max
     double sum = 0.0;
+    double sum_sq = 0.0;
+    double max = 0.0;
     for (double val: data.pixels) {
         sum += val;
+        sum_sq += val * val;
+    
+        if (val > max) {
+            max = val;
+        }
     }
     data.intensity_mean = sum / num_pixels;
-
-    // standard deviation
-    double sum_of_diff = 0.0;
-    for (double val: data.pixels) {
-        sum_of_diff += (val - data.intensity_mean) * (val - data.intensity_mean);
-    }
-    data.intensity_standard_deviation = sqrt(sum_of_diff / num_pixels);
+    data.intensity_standard_deviation = sqrt((sum_sq / num_pixels) - (data.intensity_mean * data.intensity_mean));
     
-    // threshold and mask
+    // threshold
     data.intensity_threshold = data.intensity_mean + THRESHOLD_CONSTANT * data.intensity_standard_deviation;
+    if (data.intensity_threshold >= max) {
+        std::cout << "Warning: Computed threshold exceeds max intensity." << std::endl;
+        data.intensity_threshold = data.intensity_mean + 0.8 * (max - data.intensity_mean);
+    }
+
+    // mask
     data.pixels_mask.resize(num_pixels);
     for (long i = 0; i < num_pixels; i++) {
         data.pixels_mask[i] = (data.pixels[i] >= data.intensity_threshold);
@@ -134,6 +143,22 @@ ImageData fits_to_data(const std::string& filename) {
             cluster.y_centroid = sum_y / sum_intensity;
             cluster.total_intensity = sum_intensity;
         }
+    }
+
+    // keep top 50 brightest clusters
+    std::sort(data.clusters.begin(), data.clusters.end(), [](const Cluster& a, const Cluster& b) {
+        return a.total_intensity > b.total_intensity;
+    });
+    if (data.clusters.size() > 50) {
+        data.clusters.resize(50);
+    }
+
+    // Debug: Print the top 3 to see if they look real
+    for(int i=0; i<3 && i < (int)data.clusters.size(); i++) {
+        std::cout << "Star " << i << ": Pos(" 
+                << data.clusters[i].x_centroid << ", " 
+                << data.clusters[i].y_centroid << ") Intensity: " 
+                << data.clusters[i].total_intensity << std::endl;
     }
 
     fits_close_file(fptr, &status);
