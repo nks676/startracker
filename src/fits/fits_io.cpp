@@ -154,12 +154,12 @@ ImageData fits_to_data(const std::string& filename) {
     }
 
     // Debug: Print the top 3 to see if they look real
-    for(int i=0; i<3 && i < (int)data.clusters.size(); i++) {
-        std::cout << "Star " << i << ": Pos(" 
-                << data.clusters[i].x_centroid << ", " 
-                << data.clusters[i].y_centroid << ") Intensity: " 
-                << data.clusters[i].total_intensity << std::endl;
-    }
+    // for(int i=0; i<3 && i < (int)data.clusters.size(); i++) {
+    //     std::cout << "Star " << i << ": Pos(" 
+    //             << data.clusters[i].x_centroid << ", " 
+    //             << data.clusters[i].y_centroid << ") Intensity: " 
+    //             << data.clusters[i].total_intensity << std::endl;
+    // }
 
     fits_close_file(fptr, &status);
 

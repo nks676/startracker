@@ -6,12 +6,13 @@ TARGET = app
 
 # --- Directory and Source Definitions ---
 SRC_DIR = src
-DATA_HANDLER_SRC = $(SRC_DIR)/fits/fits_io.cpp
-CATALOG_HANDLER_SRC = $(SRC_DIR)/catalog/catalog.cpp
+DATA_SRC = $(SRC_DIR)/fits/fits_io.cpp
+CATALOG_SRC = $(SRC_DIR)/catalog/catalog.cpp
+TRIANGLE_SRC = $(SRC_DIR)/triangle/triangle.cpp
 MAIN_SRC = $(SRC_DIR)/main.cpp
 
 # List all your source files here. Add more as you create them (detector.cpp, solver.cpp)
-SRCS = $(MAIN_SRC) $(DATA_HANDLER_SRC) $(CATALOG_HANDLER_SRC)
+SRCS = $(MAIN_SRC) $(DATA_SRC) $(CATALOG_SRC) $(TRIANGLE_SRC)
 
 # Convert source file names (.cpp) to object file names (.o)
 OBJS = $(SRCS:.cpp=.o)
