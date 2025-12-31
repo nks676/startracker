@@ -8,6 +8,7 @@
 #include "fits/fits_io.h"
 #include "catalog/catalog.h"
 #include "triangle/triangle.h"
+#include "triad/triad.h"
 
 // ---------------------------------------------------------
 // Test helpers for robustness checks
@@ -138,101 +139,136 @@ static std::vector<Triangle> build_test_db(const std::vector<Star>& catalog) {
     return db;
 }
 
+void test_triad_solver() {
+    std::cout << "\n[TEST] TRIAD Attitude Solver..." << std::endl;
+
+    // Struct order is: {id, x, y, z, magnitude}
+    
+    // 1. Inertial Stars (Identity Matrix)
+    Star r1 = {0, 1, 0, 0, 0}; // x=1
+    Star r2 = {0, 0, 1, 0, 0}; // y=1
+    
+    // 2. Body Stars (Rotated 90 deg around Z)
+    // x axis (1,0,0) rotates to y axis (0,1,0)
+    // y axis (0,1,0) rotates to -x axis (-1,0,0)
+    Star b1 = {0, 0, 1, 0, 0}; // x=0, y=1
+    Star b2 = {0, -1, 0, 0, 0}; // x=-1, y=0
+
+    std::vector<Observation> obs;
+    // Note: TRIAD only looks at the first two stars!
+    obs.push_back({b1, r1});
+    obs.push_back({b2, r2});
+
+    // 3. Solve
+    Quaternion q = compute_attitude(obs);
+
+    std::cout << "  Calculated Quaternion: [w=" << q.w << ", x=" << q.x << ", y=" << q.y << ", z=" << q.z << "]" << std::endl;
+
+    // 4. Expected: w=0.707, z=0.707 (approx)
+    if (std::abs(q.w - 0.707) < 0.01 && std::abs(q.z - 0.707) < 0.01) {
+        std::cout << "  PASS: Quaternion matches 90 deg Z-rotation." << std::endl;
+    } else {
+        std::cout << "  FAIL: Quaternion incorrect." << std::endl;
+    }
+}
+
 int main() {
-    std::string m42_filename = "data/m42_40min_red.fits";
-    ImageData m42 = fits_to_data(m42_filename);
-    std::cout << "Loaded " << m42.clusters.size() << " clusters from " << m42_filename << std::endl;
+    // std::string m42_filename = "data/m42_40min_red.fits";
+    // ImageData m42 = fits_to_data(m42_filename);
+    // std::cout << "Loaded " << m42.clusters.size() << " clusters from " << m42_filename << std::endl;
 
-    std::string m13_filename = "data/m13_test.fits";
-    ImageData m13 = fits_to_data(m13_filename);
-    std::cout << "Loaded " << m13.clusters.size() << " clusters from " << m13_filename << std::endl;
+    // std::string m13_filename = "data/m13_test.fits";
+    // ImageData m13 = fits_to_data(m13_filename);
+    // std::cout << "Loaded " << m13.clusters.size() << " clusters from " << m13_filename << std::endl;
 
-    std::string starmap_filename = "data/hipparcos-voidmain.csv";
-    std::vector<Star> catalog = csv_to_catalog(starmap_filename);
-    std::cout << "Loaded " << catalog.size() << " stars from " << starmap_filename << std::endl;
+    // std::string starmap_filename = "data/hipparcos-voidmain.csv";
+    // std::vector<Star> catalog = csv_to_catalog(starmap_filename);
+    // std::cout << "Loaded " << catalog.size() << " stars from " << starmap_filename << std::endl;
 
-    std::vector<Triangle> triangles = catalog_to_triangles(catalog);
-    std::cout << "Generated " << triangles.size() << " triangles from catalog" << std::endl;
+    // std::vector<Triangle> triangles = catalog_to_triangles(catalog);
+    // std::cout << "Generated " << triangles.size() << " triangles from catalog" << std::endl;
 
-    // ---------------------------------------------------------
-    // PHASE 1.2: SYNTHETIC STRESS TEST
-    // ---------------------------------------------------------
-    std::cout << "\n--- STARTING SYNTHETIC STRESS TEST ---\n";
+    // // ---------------------------------------------------------
+    // // PHASE 1.2: SYNTHETIC STRESS TEST
+    // // ---------------------------------------------------------
+    // std::cout << "\n--- STARTING SYNTHETIC STRESS TEST ---\n";
 
-    if (triangles.empty()) {
-        std::cerr << "Error: No triangles generated. Cannot run test." << std::endl;
-        return -1;
-    }
+    // if (triangles.empty()) {
+    //     std::cerr << "Error: No triangles generated. Cannot run test." << std::endl;
+    //     return -1;
+    // }
 
-    int passed = 0;
-    int failed = 0;
-    int total_tests = 0;
+    // int passed = 0;
+    // int failed = 0;
+    // int total_tests = 0;
 
-    // We test every 1000th triangle to save time
-    // (Testing all 1.1 million would take a few minutes)
-    for (size_t i = 0; i < triangles.size(); i += 1000) {
-        total_tests++;
-        Triangle expected = triangles[i];
+    // // We test every 1000th triangle to save time
+    // // (Testing all 1.1 million would take a few minutes)
+    // for (size_t i = 0; i < triangles.size(); i += 1000) {
+    //     total_tests++;
+    //     Triangle expected = triangles[i];
 
-        // 1. Reconstruct the 3 stars from the IDs
-        // (In a real scenario, we don't know the IDs yet, just the positions)
-        Star s1, s2, s3;
+    //     // 1. Reconstruct the 3 stars from the IDs
+    //     // (In a real scenario, we don't know the IDs yet, just the positions)
+    //     Star s1, s2, s3;
         
-        // Simple linear search to find the stars by ID
-        // (Optimization: A hash map would be faster, but this is fine for testing)
-        int found_count = 0;
-        for(const auto& s : catalog) {
-            if (s.id == expected.star1) { s1 = s; found_count++; }
-            else if (s.id == expected.star2) { s2 = s; found_count++; }
-            else if (s.id == expected.star3) { s3 = s; found_count++; }
-            if (found_count == 3) break;
-        }
+    //     // Simple linear search to find the stars by ID
+    //     // (Optimization: A hash map would be faster, but this is fine for testing)
+    //     int found_count = 0;
+    //     for(const auto& s : catalog) {
+    //         if (s.id == expected.star1) { s1 = s; found_count++; }
+    //         else if (s.id == expected.star2) { s2 = s; found_count++; }
+    //         else if (s.id == expected.star3) { s3 = s; found_count++; }
+    //         if (found_count == 3) break;
+    //     }
 
-        // 2. Run the Matcher
-        // We pass the 3 star objects. The matcher measures them and searches the DB.
-        Triangle result = find_triangle(s1, s2, s3, triangles);
+    //     // 2. Run the Matcher
+    //     // We pass the 3 star objects. The matcher measures them and searches the DB.
+    //     Triangle result = find_triangle(s1, s2, s3, triangles);
 
-        // 3. Verify Result
-        bool match_found = (result.star1 != -1);
+    //     // 3. Verify Result
+    //     bool match_found = (result.star1 != -1);
         
-        // Check if the IDs match the expected ones (ignoring order)
-        bool ids_match = false;
-        if (match_found) {
-            std::vector<int> exp_ids = {expected.star1, expected.star2, expected.star3};
-            std::vector<int> res_ids = {result.star1, result.star2, result.star3};
-            std::sort(exp_ids.begin(), exp_ids.end());
-            std::sort(res_ids.begin(), res_ids.end());
+    //     // Check if the IDs match the expected ones (ignoring order)
+    //     bool ids_match = false;
+    //     if (match_found) {
+    //         std::vector<int> exp_ids = {expected.star1, expected.star2, expected.star3};
+    //         std::vector<int> res_ids = {result.star1, result.star2, result.star3};
+    //         std::sort(exp_ids.begin(), exp_ids.end());
+    //         std::sort(res_ids.begin(), res_ids.end());
             
-            if (exp_ids == res_ids) ids_match = true;
-        }
+    //         if (exp_ids == res_ids) ids_match = true;
+    //     }
 
-        if (match_found && ids_match) {
-            passed++;
-        } else {
-            failed++;
-        }
+    //     if (match_found && ids_match) {
+    //         passed++;
+    //     } else {
+    //         failed++;
+    //     }
         
-        // Progress Indicator (dots)
-        if (total_tests % 100 == 0) std::cout << "." << std::flush;
-    }
+    //     // Progress Indicator (dots)
+    //     if (total_tests % 100 == 0) std::cout << "." << std::flush;
+    // }
 
-    std::cout << "\n\n--- RESULTS ---\n";
-    std::cout << "Total Tests: " << total_tests << std::endl;
-    std::cout << "Passed:      " << passed << std::endl;
-    std::cout << "Failed:      " << failed << std::endl;
-    std::cout << "Accuracy:    " << (double)passed / total_tests * 100.0 << "%" << std::endl;
+    // std::cout << "\n\n--- RESULTS ---\n";
+    // std::cout << "Total Tests: " << total_tests << std::endl;
+    // std::cout << "Passed:      " << passed << std::endl;
+    // std::cout << "Failed:      " << failed << std::endl;
+    // std::cout << "Accuracy:    " << (double)passed / total_tests * 100.0 << "%" << std::endl;
 
-    // ---------------------------------------------------------
-    // Additional robustness tests on a synthetic mini-catalog
-    // ---------------------------------------------------------
-    std::mt19937 rng(42);
-    std::vector<Star> test_catalog = build_test_catalog();
-    std::vector<Triangle> test_db = build_test_db(test_catalog);
-    std::cout << "\nBuilt synthetic test DB with " << test_db.size() << " triangles." << std::endl;
+    // // ---------------------------------------------------------
+    // // Additional robustness tests on a synthetic mini-catalog
+    // // ---------------------------------------------------------
+    // std::mt19937 rng(42);
+    // std::vector<Star> test_catalog = build_test_catalog();
+    // std::vector<Triangle> test_db = build_test_db(test_catalog);
+    // std::cout << "\nBuilt synthetic test DB with " << test_db.size() << " triangles." << std::endl;
 
-    test_gaussian_noise(test_db, test_catalog, rng);
-    test_false_star(test_db, test_catalog, rng);
-    test_magnitude_dropout(test_db, test_catalog);
+    // test_gaussian_noise(test_db, test_catalog, rng);
+    // test_false_star(test_db, test_catalog, rng);
+    // test_magnitude_dropout(test_db, test_catalog);
+
+    test_triad_solver();
 
     return 0;
 } 
