@@ -1,0 +1,3 @@
+/Users/narensathishkumar/work/startracker/build/CMakeFiles/startracker.dir
+/Users/narensathishkumar/work/startracker/build/CMakeFiles/edit_cache.dir
+/Users/narensathishkumar/work/startracker/build/CMakeFiles/rebuild_cache.dir
