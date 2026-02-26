@@ -1,6 +1,5 @@
 #include "estimation.h"
 #include <cmath>
-#include <iostream>
 #include <stdexcept>
 
 struct Vec3 {
@@ -73,10 +72,6 @@ Quaternion estimate_attitude(const std::vector<IdentifiedStar> &stars,
   Vec3 V1 = {cat1.x, cat1.y, cat1.z};
   Vec3 V2 = {cat2.x, cat2.y, cat2.z};
 
-  std::cout << "DEBUG: W1 (Cam) = [" << W1.x << ", " << W1.y << ", " << W1.z
-            << "]\n";
-  std::cout << "DEBUG: V1 (ICRS) = [" << V1.x << ", " << V1.y << ", " << V1.z
-            << "]\n";
   // TRIAD for Camera frame (W)
   Vec3 t1W = W1;
   Vec3 t2W = normalize(cross(W1, W2));
@@ -88,32 +83,7 @@ Quaternion estimate_attitude(const std::vector<IdentifiedStar> &stars,
   Vec3 t3V = cross(t1V, t2V);
 
   // R = M_W * M_V^T
-  // M_W = [t1W | t2W | t3W]
-  // M_V = [t1V | t2V | t3V]
-
   double R[3][3];
-  for (int r = 0; r < 3; ++r) {
-    for (int c = 0; c < 3; ++c) {
-      double wr = (r == 0) ? t1W.x : (r == 1) ? t1W.y : t1W.z;
-      if (c == 1)
-        wr = (r == 0) ? t2W.x : (r == 1) ? t2W.y : t2W.z;
-      if (c == 2)
-        wr = (r == 0) ? t3W.x : (r == 1) ? t3W.y : t3W.z;
-
-      // M_V^T
-      double vc = (c == 0) ? t1V.x : (c == 1) ? t2V.x : t3V.x;
-      if (r == 1)
-        vc = (c == 0) ? t1V.y : (c == 1) ? t2V.y : t3V.y;
-      if (r == 2)
-        vc = (c == 0) ? t1V.z : (c == 1) ? t2V.z : t3V.z;
-
-      // Wait, standard matrix mult: R = \sum_k M_W(r, k) * M_V^T(k, c)
-      // = \sum_k M_W(r, k) * M_V(c, k)
-      R[r][c] = 0;
-    }
-  }
-
-  // Let's do it cleanly:
   double M_W[3][3] = {
       {t1W.x, t2W.x, t3W.x}, {t1W.y, t2W.y, t3W.y}, {t1W.z, t2W.z, t3W.z}};
 
@@ -127,19 +97,8 @@ Quaternion estimate_attitude(const std::vector<IdentifiedStar> &stars,
     }
   }
 
-  std::cout << "DEBUG: W2 (Cam) = [" << W2.x << ", " << W2.y << ", " << W2.z
-            << "]\n";
-  std::cout << "DEBUG: V2 (ICRS) = [" << V2.x << ", " << V2.y << ", " << V2.z
-            << "]\n";
-
   // Convert R (Rotation Matrix) to Quaternion [x,y,z,w]
-  std::cout << "DEBUG Matrix R:\n";
-  for (int r = 0; r < 3; ++r) {
-    std::cout << R[r][0] << " " << R[r][1] << " " << R[r][2] << "\n";
-  }
-
   double tr = R[0][0] + R[1][1] + R[2][2];
-  std::cout << "DEBUG Trace: " << tr << "\n";
   Quaternion q;
 
   if (tr > 0) {

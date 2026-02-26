@@ -59,11 +59,6 @@ int main(int argc, char **argv) {
 
   auto identified = identify_stars(centroids, camera, db, cos_tol);
   std::cout << "Identified " << identified.size() << " stars.\n";
-  std::cout << "Identified HIPs: ";
-  for (const auto &is : identified) {
-    std::cout << is.catalog_hip_id << " ";
-  }
-  std::cout << "\n";
 
   if (identified.size() < 2) {
     std::cerr << "Not enough stars identified for attitude estimation.\n";

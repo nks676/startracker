@@ -2,19 +2,267 @@
 
 This plan outlines the iterative development approach for the highly robust embedded star tracking engine. We will start with a simple, accurate baseline, establish rigorous testing, and progressively upgrade the algorithms for performance.
 
-## Phase 1: Bare Minimum Baseline (Slow but Accurate)
-The goal is to get an end-to-end pipeline working with the simplest possible algorithms to ensure accuracy before optimizing for speed.
+---
 
-*   **Image Processing:** Standard Center of Gravity (CoG) for centroiding instead of Fast Gaussian Fitting.
-*   **Identification:** Simple brute-force pattern matching or basic subgraph matching, rather than optimized $k$-vector database lookups.
-*   **Attitude Estimation:** Basic TRIAD or Singular Value Decomposition (SVD) algorithm to solve Wahba's problem, instead of QUEST.
+## Phase 1: Bare Minimum Baseline — COMPLETE ✅
+
+End-to-end pipeline is functional. Achieves ~0.004° error on identity-quaternion synthetic test.
+
+| Component | File | Description |
+|---|---|---|
+| Synthetic data | `tools/generate_synthetic_data.py` | Downloads Hipparcos via Vizier, renders starfield PNGs with Poisson + Gaussian noise |
+| Catalog builder | `tools/generate_catalog.py` | Builds binary star catalog and pairwise angular-distance database |
+| Accuracy checker | `tools/verify_accuracy.py` | Compares estimated quaternion against ground truth |
+| Image processing | `src/image_processing.cpp` | Connected-component BFS + Center-of-Gravity (CoG) centroiding |
+| Catalog loader | `src/catalog.cpp` | Loads binary catalog, binary-search on sorted cosine pairs |
+| Star identification | `src/identification.cpp` | Pairwise angular-distance voting with duplicate-HIP resolution |
+| Attitude estimation | `src/estimation.cpp` | TRIAD algorithm for attitude determination |
+| CLI driver | `src/main.cpp` | image → centroids → identification → TRIAD → quaternion |
+
+---
 
 ## Phase 2: End-to-End CI/CD Infrastructure
-Before making the system complex, we need an automated safety net to ensure continued accuracy as we optimize.
 
-*   Set up automated unit testing for the C++ core.
-*   Build a CI/CD pipeline (e.g., GitHub Actions) to compile the code and run tests on every commit.
-*   Implement baseline Monte Carlo simulations in Python to validate the accuracy of the slow-but-accurate algorithms against synthetic star fields.
+**Goal:** Before optimizing algorithms in Phase 3, create an automated safety net: unit tests, CI/CD, and Monte Carlo accuracy validation. This ensures that every future change is regression-tested.
+
+---
+
+### Step 1: Add GoogleTest to the CMake Project
+
+We'll use GoogleTest (via CMake's `FetchContent`) so there are zero system dependencies to install.
+
+#### 1a. Edit `CMakeLists.txt`
+
+After the existing `add_executable(startracker ...)` block, add:
+
+```cmake
+# --- Testing ---
+include(FetchContent)
+FetchContent_Declare(
+  googletest
+  GIT_REPOSITORY https://github.com/google/googletest.git
+  GIT_TAG        v1.14.0
+)
+FetchContent_MakeAvailable(googletest)
+enable_testing()
+
+# Build core as a static library so both main and tests can link against it
+add_library(startracker_core STATIC
+    src/image_processing.cpp
+    src/catalog.cpp
+    src/identification.cpp
+    src/estimation.cpp
+)
+
+# Main executable links against the core library
+target_link_libraries(startracker PRIVATE startracker_core)
+
+# Test executable
+add_executable(startracker_tests
+    tests/test_image_processing.cpp
+    tests/test_catalog.cpp
+    tests/test_identification.cpp
+    tests/test_estimation.cpp
+)
+target_link_libraries(startracker_tests PRIVATE startracker_core GTest::gtest_main)
+
+include(GoogleTest)
+gtest_discover_tests(startracker_tests)
+```
+
+Also update the original `add_executable(startracker ...)` to only list `src/main.cpp` (since the other `.cpp` files are now in the library).
+
+#### 1b. Create `tests/` directory
+
+```bash
+mkdir -p tests
+```
+
+#### 1c. Verify the build
+
+```bash
+cd build && cmake .. && make
+```
+
+---
+
+### Step 2: Write Unit Tests
+
+Create four test files. Each test file should `#include <gtest/gtest.h>` and the relevant header.
+
+#### 2a. `tests/test_image_processing.cpp`
+
+Test `extract_centroids` on a handcrafted image buffer:
+
+1.  **Single star test.** Create a small (e.g. 32×32) `uint8_t` buffer. Set pixels in a 3×3 block around `(16, 16)` to known intensities (e.g., center=200, neighbors=150). Call `extract_centroids` with threshold=100. Assert exactly 1 centroid is returned. Assert `centroid.x` and `centroid.y` are close to (16, 16) with `EXPECT_NEAR(..., ..., 0.5)`.
+
+2.  **Two stars test.** Place two non-overlapping bright spots. Assert 2 centroids returned, each near the expected position.
+
+3.  **No stars test.** All-black (or all below threshold) image. Assert 0 centroids.
+
+4.  **Noise rejection test.** Fill image with uniform random values between 0-80, threshold=100. Assert 0 centroids (no false positives from noise alone).
+
+#### 2b. `tests/test_catalog.cpp`
+
+Use the **real Hipparcos catalog** files (`data/catalog_stars.bin` and `data/catalog_pairs.bin`) generated by `tools/generate_catalog.py`. The test fixture's `SetUp()` should load these files. If they don't exist, regenerate them by running the catalog builder as a pre-test step.
+
+Tests:
+1.  **`get_star` returns correct data** for a well-known bright star (e.g., HIP 32349 = Sirius). Verify its unit vector and magnitude match expected values.
+2.  **`get_star` throws** for a nonexistent HIP id (e.g., 999999).
+3.  **`find_pairs` returns correct results.** Pick two real catalog stars, compute their true angular distance, and verify `find_pairs` returns them within a tight cosine tolerance.
+4.  **`find_pairs` returns empty** when tolerance is zero and no exact match exists.
+
+#### 2c. `tests/test_identification.cpp`
+
+Use the **real Hipparcos catalog** loaded from the binary files to test the full identification pipeline against real star data:
+
+1.  Load the real catalog via `StarDatabase("data/catalog_stars.bin", "data/catalog_pairs.bin")`.
+2.  Create a `PinholeCamera` with known focal length and resolution.
+3.  Choose 4-5 **real catalog stars** from a known sky region (e.g., stars near the boresight direction [0, 0, 1]).
+4.  Project those real catalog unit vectors through a known rotation to get "observed" camera-frame vectors, then un-project to pixel centroids.
+5.  Call `identify_stars` with the real catalog. Assert each image star maps to the correct catalog HIP.
+6.  **False star test.** Add a centroid that doesn't correspond to any real catalog star. Assert it is *not* in the identified list.
+
+#### 2d. `tests/test_estimation.cpp`
+
+1.  **Identity rotation test.** Set camera vectors = inertial vectors (i.e., R = I). Assert quaternion ≈ [0, 0, 0, 1].
+2.  **Known 90° rotation test.** Manually rotate vectors by 90° around Z. Assert quaternion ≈ [0, 0, sin(π/4), cos(π/4)].
+3.  **Consistency check.** Generate a random rotation, apply it to get camera vectors, run TRIAD, verify the output quaternion reproduces the original rotation (angular error < 0.01°).
+
+#### 2e. Verify tests pass
+
+```bash
+cd build && cmake .. && make && ctest --output-on-failure
+```
+
+---
+
+### Step 3: Set Up GitHub Actions CI
+
+#### 3a. Create `.github/workflows/ci.yml`
+
+```yaml
+name: CI
+on: [push, pull_request]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Unit Tests
+        run: cd build && ctest --output-on-failure
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python deps
+        run: pip install -r tools/requirements.txt
+
+      - name: Integration Test (single image)
+        run: |
+          cd tools
+          python generate_synthetic_data.py --quat 0 0 0 1 --out ../data/ci_test
+          python generate_catalog.py
+          cd ..
+          ./build/startracker data/ci_test/synthetic_starfield.png data/catalog_stars.bin data/catalog_pairs.bin 20 | tee result.txt
+          QUAT=$(grep "Estimated Quaternion:" result.txt | sed 's/Estimated Quaternion: \[//;s/\]//;s/,//g')
+          cd tools
+          python verify_accuracy.py --truth ../data/ci_test/truth.json --est $QUAT
+```
+
+#### 3b. Push and verify the workflow runs green
+
+```bash
+git add .github/
+git commit -m "Add CI workflow"
+git push
+```
+
+---
+
+### Step 4: Monte Carlo Accuracy Validation
+
+This is a Python script that generates many random orientations, runs the C++ engine on each, and reports aggregate statistics. This is the most important part of Phase 2 — it tells you *how robust* the baseline really is.
+
+#### 4a. Create `tools/monte_carlo.py`
+
+The script should:
+
+1.  Accept CLI args: `--num-trials` (default 100), `--fov`, `--res`, `--noise`.
+2.  For each trial:
+    *   Generate a random unit quaternion: `q = np.random.randn(4); q /= np.linalg.norm(q); if q[3] < 0: q = -q` (canonical positive-w).
+    *   Call `generate_synthetic_data.py`'s `generate_image()` function directly (import it, don't subprocess).
+    *   Run the C++ `startracker` binary via `subprocess.run()`, parse the `Estimated Quaternion:` line from stdout.
+    *   Compute angular error using `scipy.spatial.transform.Rotation`.
+    *   Record: trial index, ground-truth quat, estimated quat, angular error, number of stars identified.
+3.  After all trials, print:
+    *   **Success rate** (% of trials with error < 1°).
+    *   **Median / Mean / Max / 95th percentile** angular error of successful trials.
+    *   **Failure cases** (error > 5° or "Not enough stars identified") with their ground-truth quaternions for debugging.
+4.  Save results to a CSV: `data/monte_carlo_results.csv`.
+
+#### 4b. Run the Monte Carlo
+
+```bash
+cd tools && source venv/bin/activate
+python monte_carlo.py --num-trials 50 --fov 20 --noise 5
+```
+
+Review the results. If success rate is below ~80%, the identification stage likely needs the fixes from the Phase 1 review (especially issues #3 and #4). Fix and re-run until you're confident in the baseline.
+
+#### 4c. Add Monte Carlo to CI (optional, as a nightly job)
+
+Since Monte Carlo is slow (~5-10 min for 50 trials), you can add it as a separate GitHub Actions workflow triggered on `schedule` (cron) or `workflow_dispatch` rather than every push.
+
+---
+
+### Step 5: Add a `.gitignore` and Clean Up
+
+#### 5a. Create `.gitignore`
+
+```
+build/
+data/
+tools/venv/
+tools/hipparcos_cached.npy
+*.pyc
+__pycache__/
+```
+
+#### 5b. Final commit
+
+
+```bash
+git add -A
+git commit -m "Phase 2: unit tests, CI/CD, Monte Carlo validation"
+```
+
+---
+
+### Phase 2 Checklist
+
+- [ ] Step 1: GoogleTest in CMake, `startracker_core` library
+- [ ] Step 2a: `tests/test_image_processing.cpp`
+- [ ] Step 2b: `tests/test_catalog.cpp` (real Hipparcos catalog)
+- [ ] Step 2c: `tests/test_identification.cpp` (real Hipparcos catalog)
+- [ ] Step 2d: `tests/test_estimation.cpp`
+- [ ] Step 2e: All tests passing in `ctest`
+- [ ] Step 3: `.github/workflows/ci.yml` running green
+- [ ] Step 4a: `tools/monte_carlo.py` written
+- [ ] Step 4b: Monte Carlo results reviewed, success rate acceptable
+- [ ] Step 5: `.gitignore`, clean commit
+
+---
 
 ## Phase 3: Algorithm Optimization (Faster & More Robust)
 With CI/CD in place, we will iteratively replace the basic algorithms with state-of-the-art, high-performance versions, validating against our tests along the way.
