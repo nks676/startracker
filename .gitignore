@@ -1,0 +1,19 @@
+# Build output
+build/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+tools/venv/
+*.npy
+
+# macOS
+.DS_Store
+
+# Runtime output
+result.txt
+
+# Test data
+data/test_img/
