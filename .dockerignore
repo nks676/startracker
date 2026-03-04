@@ -1,5 +1,9 @@
 build/
+data/
 venv/
+tools/venv/
 __pycache__/
+*.npy
+result.txt
 .git/
 .DS_Store

@@ -1,6 +1,9 @@
 # Build output
 build/
 
+# Generated data (reproducible via tools/)
+data/
+
 # Python
 __pycache__/
 *.pyc
@@ -9,11 +12,8 @@ venv/
 tools/venv/
 *.npy
 
-# macOS
-.DS_Store
-
 # Runtime output
 result.txt
 
-# Test data
-data/test_img/
+# macOS
+.DS_Store

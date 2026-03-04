@@ -53,9 +53,12 @@ int main(int argc, char **argv) {
   camera.focal_x = width / (2.0 * std::tan(fov_deg * M_PI / 180.0 / 2.0));
   camera.focal_y = camera.focal_x; // square pixels
 
-  // Tolerance is purely angular in cosine space
-  // 1e-6 cos tol is ~0.08 degrees. Which is ~4 pixels.
-  double cos_tol = 1e-6;
+  // cos_tol drives catalog pair matching during voting.
+  // With f ≈ width/(2*tan(fov/2)) and ~0.1-px centroid noise, a star-pair at
+  // angle θ produces a cosine error of ~sin(θ)*√2*(0.1/f).  For θ=10° and
+  // f=2903 px that's ~8.5e-6, so 1e-5 gives a comfortable safety margin while
+  // keeping false-match density low enough for the voting threshold to hold.
+  double cos_tol = 1e-5;
 
   auto identified = identify_stars(centroids, camera, db, cos_tol);
   std::cout << "Identified " << identified.size() << " stars.\n";

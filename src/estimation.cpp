@@ -1,5 +1,6 @@
 #include "estimation.h"
 #include <cmath>
+#include <iostream>
 #include <stdexcept>
 
 struct Vec3 {
@@ -26,11 +27,13 @@ Quaternion estimate_attitude(const std::vector<IdentifiedStar> &stars,
   }
 
   // Pick the two stars with the largest angular separation that ALSO form a
-  // valid pair
+  // valid pair (camera dot product consistent with catalog dot product).
+  // Tolerance of 1e-3 accounts for ~0.05 deg centroid noise.
   int best_i = -1, best_j = -1;
   double max_sep = -1.0;
-  for (int i = 0; i < stars.size(); ++i) {
-    for (int j = i + 1; j < stars.size(); ++j) {
+  double best_diff = 1e9;
+  for (int i = 0; i < (int)stars.size(); ++i) {
+    for (int j = i + 1; j < (int)stars.size(); ++j) {
       // Camera vectors
       Vec3 w_i = {stars[i].v_cam[0], stars[i].v_cam[1], stars[i].v_cam[2]};
       Vec3 w_j = {stars[j].v_cam[0], stars[j].v_cam[1], stars[j].v_cam[2]};
@@ -43,8 +46,13 @@ Quaternion estimate_attitude(const std::vector<IdentifiedStar> &stars,
       Vec3 v_j = {c_j.x, c_j.y, c_j.z};
       double dV = dot(v_i, v_j);
 
-      // Must be a consistent pair
-      if (std::abs(dW - dV) < 1e-4) {
+      double diff = std::abs(dW - dV);
+      if (diff < best_diff)
+        best_diff = diff; // track for diagnostics
+
+      // 3e-3 cos tolerance ≈ 0.17° – wide enough for real centroid noise while
+      // still rejecting badly misidentified stars (whose diffs would be >> 0.01)
+      if (diff < 3e-3) {
         double sep = 1.0 - dW;
         if (sep > max_sep) {
           max_sep = sep;
@@ -56,6 +64,8 @@ Quaternion estimate_attitude(const std::vector<IdentifiedStar> &stars,
   }
 
   if (best_i == -1 || best_j == -1) {
+    std::cerr << "TRIAD: no valid pair found. Best |dW-dV| across "
+              << stars.size() << " stars = " << best_diff << "\n";
     throw std::runtime_error("No valid pairs found for TRIAD");
   }
 

@@ -17,18 +17,19 @@ RUN apt-get update && apt-get install -y \
 # 4. Set the working directory inside the container to /app
 WORKDIR /app
 
-# 5. Copy your entire project from your Mac into the /app folder in the container
+# 5. Copy your entire project into the container
 COPY . /app
 
-# 6. Install the Python dependencies (using a virtual environment is best practice even in Docker, 
-#    but for simplicity here we'll just install system-wide or use --break-system-packages if needed, 
-#    or create a venv. Let's create a venv to be safe with newer Debian/Ubuntu)
+# 6. Install Python dependencies in a virtual environment
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 RUN pip3 install --no-cache-dir -r tools/requirements.txt
 
-# 7. Create a small build script so we can easily compile the code
+# 7. Build the C++ startracker engine
 RUN mkdir -p build && cd build && cmake .. && make
 
-# 8. By default, when the container starts, open a bash terminal so you can poke around
+# 8. Make the test script executable
+RUN chmod +x test_phase1.sh
+
+# 9. By default, open a bash terminal so you can poke around
 CMD ["/bin/bash"]
