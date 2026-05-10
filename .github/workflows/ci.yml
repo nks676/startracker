@@ -30,5 +30,8 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r tools/requirements.txt
 
-      - name: Integration Test
-        run: bash test_full_pipeline.sh
+      - name: Full Pipeline Test
+        run: bash tests/test_full_pipeline.sh
+
+      - name: Monte Carlo Validation
+        run: bash tests/test_monte_carlo.sh

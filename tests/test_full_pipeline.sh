@@ -3,7 +3,7 @@
 # Usage: bash test_full_pipeline.sh (from any directory)
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo "=== Full Pipeline Test ==="
 
