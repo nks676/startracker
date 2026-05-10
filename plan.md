@@ -21,7 +21,7 @@ End-to-end pipeline is functional. Achieves ~0.004° error on identity-quaternio
 
 ---
 
-## Phase 2: End-to-End CI/CD Infrastructure
+## Phase 2: End-to-End CI/CD Infrastructure — COMPLETE ✅
 
 **Goal:** Before optimizing algorithms in Phase 3, create an automated safety net: unit tests, CI/CD, and Monte Carlo accuracy validation. This ensures that every future change is regression-tested.
 
@@ -251,22 +251,250 @@ git commit -m "Phase 2: unit tests, CI/CD, Monte Carlo validation"
 
 ### Phase 2 Checklist
 
-- [ ] Step 1: GoogleTest in CMake, `startracker_core` library
-- [ ] Step 2a: `tests/test_image_processing.cpp`
-- [ ] Step 2b: `tests/test_catalog.cpp` (real Hipparcos catalog)
-- [ ] Step 2c: `tests/test_identification.cpp` (real Hipparcos catalog)
-- [ ] Step 2d: `tests/test_estimation.cpp`
-- [ ] Step 2e: All tests passing in `ctest`
-- [ ] Step 3: `.github/workflows/ci.yml` running green
-- [ ] Step 4a: `tools/monte_carlo.py` written
-- [ ] Step 4b: Monte Carlo results reviewed, success rate acceptable
-- [ ] Step 5: `.gitignore`, clean commit
+- [x] Step 1: GoogleTest in CMake, `startracker_core` library
+- [x] Step 2a: `tests/test_image_processing.cpp`
+- [x] Step 2b: `tests/test_catalog.cpp` (real Hipparcos catalog)
+- [x] Step 2c: `tests/test_identification.cpp` (real Hipparcos catalog)
+- [x] Step 2d: `tests/test_estimation.cpp`
+- [x] Step 2e: All tests passing in `ctest`
+- [x] Step 3: `.github/workflows/ci.yml` running green
+- [x] Step 4a: `tools/monte_carlo.py` written
+- [x] Step 4b: Monte Carlo results reviewed, success rate acceptable
+- [x] Step 5: `.gitignore`, clean commit
 
 ---
 
-## Phase 3: Algorithm Optimization (Faster & More Robust)
-With CI/CD in place, we will iteratively replace the basic algorithms with state-of-the-art, high-performance versions, validating against our tests along the way.
+## Phase 3: Algorithm Optimization, Real-World Robustness & Tracking
 
-*   **Centroiding Upgrade:** Replace standard CoG with Fast Gaussian Fitting (FGF) for fast sub-pixel precision.
-*   **Search & Match Upgrade:** Implement $k$-vector $O(1)$ search lookups and Geometric Voting for robust "Lost-in-Space" identification.
-*   **Estimation Upgrade:** Replace the TRIAD/SVD solver entirely with the highly optimized QUEST (QUaternion ESTimator) algorithm.
+With CI/CD in place, we iteratively upgrade algorithms, harden the pipeline for real camera images, and add frame-to-frame tracking. Each step is regression-tested against the existing test suite.
+
+---
+
+### Phase 3a — Real-World Robustness (Image Processing Hardening)
+
+**Goal:** Make the pipeline work on real star field images from cameras like PiFinder (Raspberry Pi HQ Camera + CS-mount lens), not just clean synthetic data.
+
+#### 3a.1: Camera Distortion Model
+
+Replace the simple `PinholeCamera` struct with a full `CameraModel` class using the Brown-Conrady distortion model (k1, k2, k3 radial + p1, p2 tangential). This is the same model OpenCV and astrometry.net use.
+
+- **New files:** `src/camera_model.h`, `src/camera_model.cpp`
+- **Key methods:** `undistort_to_unit_vector(px, py)` (iterative Newton's method), `project(v_cam)` (forward projection with distortion)
+- **Refactor:** `identify_stars()` accepts `CameraModel&` instead of `PinholeCamera`. Replace inline pixel→unit-vector conversion with camera model call.
+- **Update:** `generate_synthetic_data.py` gains `--distortion k1 k2 p1 p2 k3` flag for rendering distorted test images.
+- **Why first:** Without distortion correction, stars near image edges have arcminute-level errors that break identification. Every subsequent improvement depends on correct unit vectors.
+
+**Tests:**
+- Round-trip: project → undistort, verify recovered unit vector matches within 1e-8
+- Zero-distortion produces identical results to old `PinholeCamera`
+- Monte Carlo with k1=-0.3 (typical PiFinder barrel distortion)
+
+#### 3a.2: Background Subtraction
+
+New preprocessing step before centroiding. Median filter with large kernel (32×32 or 64×64) estimates the background, then subtract it. Removes vignetting gradients, light pollution, sensor glow.
+
+- **Modify:** `src/image_processing.cpp` — new `subtract_background()` function
+- **Tests:** Linear gradient + point sources → verify centroids preserved, gradient removed
+
+#### 3a.3: Adaptive Thresholding
+
+Replace the hardcoded `threshold=100` with local sigma-clipping. For each tile (64×64), threshold = local_mean + k × local_stddev. Standard approach in astronomical source extraction (SExtractor, SEP).
+
+- **Modify:** `src/image_processing.cpp` — new `extract_centroids_adaptive()` function
+- **Keep:** Old `extract_centroids()` with fixed threshold for backward-compatible unit tests
+- **Tests:** Image with two quadrants at different background levels — fixed threshold fails, adaptive succeeds
+
+#### 3a.4: Hot Pixel / Outlier Rejection
+
+Filter connected components by shape to reject artifacts:
+- Min pixel count > 1 (reject single-pixel hot pixels)
+- Max pixel count < 200 (reject extended objects, satellite trails)
+- Aspect ratio < 3:1 (reject streaks)
+- Border margin > 5px (reject edge artifacts)
+
+- **Modify:** `src/image_processing.cpp`
+- **Tests:** Single hot pixel rejected, long streak rejected
+
+#### 3a.5: Real Image Test Pipeline
+
+Source real star field images and integrate them into testing.
+
+- **Image sources:** ESA Tetra3 dataset, astrometry.net sample images, user-captured photos (PiFinder, DSLR)
+- **Ground truth:** Plate-solve with astrometry.net's `solve-field` to get WCS → convert to quaternion
+- **New files:**
+  - `tools/download_test_images.py` — downloads curated test image set
+  - `tools/plate_solve.py` — wrapper around `solve-field`, outputs truth JSON
+  - `tests/test_real_images.sh` — loops over `data/real_images/*/`, runs tracker, checks accuracy
+- **Directory structure:**
+  ```
+  data/real_images/
+    image_001/
+      image.png
+      camera.json   (fx, fy, cx, cy, k1, k2, p1, p2, k3)
+      truth.json    (quaternion_xyzw)
+  ```
+- **Threshold:** < 5° initially (tighten as calibration improves). Non-blocking in CI at first (`continue-on-error: true`)
+
+#### Phase 3a Checklist
+
+- [ ] 3a.1: Camera distortion model (Brown-Conrady)
+- [ ] 3a.2: Background subtraction
+- [ ] 3a.3: Adaptive thresholding
+- [ ] 3a.4: Hot pixel / outlier rejection
+- [ ] 3a.5: Real image test pipeline
+- [ ] Monte Carlo success rate ≥ 85%
+
+---
+
+### Phase 3b — Algorithm Upgrades (Accuracy)
+
+**Goal:** Replace baseline algorithms with state-of-the-art, statistically optimal versions. These are the resume-worthy upgrades.
+
+#### 3b.1: Iterative Weighted Gaussian Centroiding
+
+Replace Center-of-Gravity (CoG) with Gaussian-weighted iterative centroiding. After BFS finds the connected component, run 3-5 iterations:
+```
+for each iteration:
+  w = exp(-((px - cx)² + (py - cy)²) / (2σ²))
+  cx = Σ(px × I × w) / Σ(I × w)
+  cy = Σ(py × I × w) / Σ(I × w)
+```
+
+Improves sub-pixel accuracy from ~0.1px (CoG) to ~0.01-0.05px. At f=2903px (20° FOV on 1024×1024), this reduces pointing error from ~7 arcsec to ~1 arcsec.
+
+- **Modify:** `src/image_processing.cpp`
+- **Tests:** Sub-pixel-offset Gaussian PSF — verify Gaussian centroid is closer to true center than CoG
+
+#### 3b.2: QUEST Attitude Estimator
+
+Replace TRIAD with QUEST (Shuster & Oh 1981) — the optimal solution to Wahba's problem. Uses ALL N identified stars (TRIAD only uses the best 2).
+
+**Algorithm:**
+1. Compute B matrix: `B = Σ(aᵢ × wᵢ × vᵢᵀ)` (weighted outer products of camera/inertial vectors)
+2. Compute S, σ, Z from B
+3. Newton-Raphson on characteristic equation for largest eigenvalue λ_max
+4. Compute optimal quaternion from λ_max
+
+- **Modify:** `src/estimation.cpp` — replace body of `estimate_attitude()`, keep same signature
+- **Fallback:** If Newton-Raphson fails to converge (degenerate/collinear stars), fall back to TRIAD
+- **Resume value:** Industry gold standard — every spacecraft attitude paper references QUEST
+- **Tests:**
+  - Existing tests still pass (identity, 90° rotation, random)
+  - N=5 stars with noise: QUEST produces lower error than TRIAD
+  - N=2: QUEST matches TRIAD within numerical precision
+
+#### 3b.3: Identification Cross-Verification
+
+Post-processing step after voting: verify that angular distances between ALL pairs of identified stars match the catalog. Reject stars that fail the cross-check.
+
+- **Modify:** `src/identification.cpp` — ~20 lines after duplicate resolution
+- **Tests:** Inject deliberately misidentified star → verify cross-check removes it
+- **Impact:** Fewer catastrophic failures (>5° errors)
+
+#### Phase 3b Checklist
+
+- [ ] 3b.1: Gaussian centroiding
+- [ ] 3b.2: QUEST attitude estimator
+- [ ] 3b.3: Identification cross-verification
+- [ ] Monte Carlo success rate ≥ 90%, per-trial threshold tightened to 0.5°
+
+---
+
+### Phase 3c — Speed Optimization
+
+**Goal:** Target <1 second on Raspberry Pi 4, <100ms on desktop.
+
+#### 3c.1: K-Vector Search (Mortari 2004)
+
+Replace binary search in `find_pairs()` with Mortari's k-vector for O(1) lookup. Precompute an index array mapping quantized cosine values to pair ranges in the sorted array.
+
+- **Modify:** `tools/generate_catalog.py` — generate `data/catalog_kvec.bin`
+- **Modify:** `src/catalog.cpp` — new `find_pairs_kvec()` method
+- **Tests:** Verify identical results to binary search, benchmark 10K lookups
+- **Resume value:** "Implemented Mortari's k-vector O(1) catalog search" — cited in virtually every star tracker paper
+
+#### 3c.2: Benchmarking Framework
+
+- **New file:** `tools/benchmark.py` — runs tracker on fixed image set, reports per-stage timings
+- **Modify:** `src/main.cpp` — `std::chrono` instrumentation behind `--benchmark` flag
+- **Output:** Centroiding time, identification time, estimation time, total time, memory usage
+
+#### Phase 3c Checklist
+
+- [ ] 3c.1: K-vector search
+- [ ] 3c.2: Benchmarking framework
+- [ ] Benchmark baseline established
+
+---
+
+### Phase 3d — Tracking Mode (Extended Kalman Filter)
+
+**Goal:** Add frame-to-frame attitude tracking for continuous operation, with reduced catalog search using prior attitude.
+
+#### 3d.1: Multiplicative EKF (MEKF)
+
+New mode added on top of the existing lost-in-space pipeline.
+
+- **New files:** `src/tracking.h`, `src/tracking.cpp`
+- **State model:** 6-state MEKF (3 rotation error + 3 angular velocity). Uses multiplicative error quaternion to avoid norm constraint issues.
+- **Predict:** Propagate quaternion using angular velocity model
+- **Update:** Use identified star vectors as measurements, compute Kalman gain
+- **CLI:** New `--tracking` mode in `main.cpp` for image sequences
+- **Resume value:** "Extended Kalman Filter for real-time attitude tracking" — fundamental in spacecraft GNC
+
+**Tests:**
+- Init with known attitude, predict forward, verify predicted quaternion
+- 20-frame smooth rotation trajectory: EKF tracks with <0.1° error
+- 10 random trajectories Monte Carlo
+
+#### 3d.2: Reduced Catalog Search
+
+When EKF has prior attitude, only search catalog stars within FOV + margin cone around predicted boresight. Requires spatial index on catalog (declination binning or HEALPix).
+
+- **Modify:** `src/catalog.cpp` — spatial index
+- **Impact:** Dramatically faster identification in tracking mode
+
+#### 3d.3: Simulated Gyro Model
+
+`GyroModel` struct with bias and noise parameters. EKF state expands to 9 (+ 3 gyro bias). Generate simulated gyro data from truth quaternion sequences for testing.
+
+- **New:** Gyro model in `src/tracking.cpp`
+- **Tests:** EKF converges with gyro + star measurements, bias estimate converges
+
+#### Phase 3d Checklist
+
+- [ ] 3d.1: MEKF core (predict + update)
+- [ ] 3d.2: Reduced catalog search
+- [ ] 3d.3: Simulated gyro model
+- [ ] Tracking-mode Monte Carlo (10 trajectories × 20 frames)
+
+---
+
+### Monte Carlo Threshold Progression
+
+| After | Min Success Rate | Per-Trial Threshold |
+|---|---|---|
+| Phase 2 (current) | 80% | < 1.0° |
+| Phase 3a | 85% | < 1.0° |
+| Phase 3b | 90% | < 0.5° |
+| Phase 3c | 90% (no change) | Add timing assertions |
+
+### Key Files Modified
+
+| Files | Steps |
+|---|---|
+| `src/image_processing.cpp/.h` | 3a.2, 3a.3, 3a.4, 3b.1 |
+| `src/identification.cpp/.h` | 3a.1, 3b.3 |
+| `src/estimation.cpp/.h` | 3b.2 |
+| `src/catalog.cpp/.h` | 3c.1, 3d.2 |
+| `src/main.cpp` | All steps |
+| `CMakeLists.txt` | New source files |
+| NEW: `src/camera_model.cpp/.h` | 3a.1 |
+| NEW: `src/tracking.cpp/.h` | 3d.1 |
+| `tools/generate_synthetic_data.py` | 3a.1 (distortion rendering) |
+| `tools/generate_catalog.py` | 3c.1 (k-vector generation) |
+
+### Parallelization
+
+- 3b.1 (Gaussian centroiding) and 3b.2 (QUEST) can be done in parallel
+- 3c.1 (k-vector) can be done in parallel with 3b
