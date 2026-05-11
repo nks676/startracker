@@ -20,5 +20,8 @@ result.txt
 # Secrets
 .env
 
+# Local Claude project-scoped instructions (kept out of public history).
+CLAUDE.md
+
 # macOS
 .DS_Store

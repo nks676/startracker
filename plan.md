@@ -349,12 +349,55 @@ Source real star field images and integrate them into testing.
       uses StarDatabase::find_partners for O(log P) seed extension.
 - [x] Monte Carlo success rate ≥ 85% — actually 100% (median 0.008°)
 - Real-image regression: Alt40 0.04°, Alt60 0.00° (ESA tetra3 samples)
+- [ ] **3a.6 (deferred): Native 16-bit TIFF input in C++.** Currently
+      `tools/test_real_images.py` does a calibrated TIFF→PNG stretch in
+      Python before feeding the binary; the binary itself only ingests
+      8-bit PNG via `stb_image`. To go pure C++ (matters for embedded
+      deployment and for preserving full dynamic range so faint stars
+      don't get crushed into noise), add a minimal uncompressed-16-bit-
+      grayscale TIFF reader + `uint16_t` overloads for
+      `subtract_background` and `extract_centroids_adaptive`, then drop
+      the Python preprocessing from `tools/test_real_images.py`. Defer
+      until real-hardware integration — the model evaluation pipeline is
+      bit-depth-agnostic at the centroid level and current results are
+      not affected.
 
 ---
 
 ### Phase 3b — Algorithm Upgrades (Accuracy)
 
 **Goal:** Replace baseline algorithms with state-of-the-art, statistically optimal versions. These are the resume-worthy upgrades.
+
+#### 3b.0: Identification robustness (carried over from 3a)
+
+Two limitations observed during 3a real-image testing that didn't block
+shipping 3a but should be addressed before 3b.1/3b.2 work piles more
+demands on identification.
+
+**3b.0a — Pyramid scaling beyond N=25.** `main.cpp` currently caps centroids
+to `CENTROID_CAP=25` before identification because the pyramid algorithm is
+O(N²) over seed pairs and grows noisy when N is dominated by faint stars
+that aren't in the mag<7 catalog. Two ways to lift the cap:
+- (a) Rank centroids by a quality metric before passing to identification
+  — peak intensity or shape compactness, not sum-of-intensity (which
+  favors saturated blobs). 8-bit clipping inflates the "intensity" of
+  saturated regions; once 3a.6 lands and we're working on 16-bit data,
+  sum-of-intensity becomes meaningful again.
+- (b) Switch the pyramid's seed enumeration to RANSAC sampling (O(K)
+  trials instead of O(N²) seed pairs). Bounded runtime regardless of N.
+
+**3b.0b — Scale-invariant identification.** The `alt60` real-image fixture
+uses `cos_tol=2e-5` instead of the synthetic default `1e-5` to absorb a
+~0.4% FOV calibration error on the tetra3 IMX265 camera. Without the
+override, identification fails on that fixture. Three possible fixes:
+- (a) Coarse identify → refine FOV from matched pair geometry → re-identify.
+- (b) Replace pair-angle features with scale-invariant triplet ratios
+  (eliminates absolute scale from the matching problem entirely).
+- (c) Grid-search a small ladder of FOV scalings during identification
+  and keep whichever produces the most inliers.
+
+Pick whichever fits naturally alongside QUEST work (3b.2). The per-fixture
+override is a documentation-only patch, not a fundamental fix.
 
 #### 3b.1: Iterative Weighted Gaussian Centroiding
 
