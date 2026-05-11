@@ -20,6 +20,10 @@ mkdir build && cd build && cmake .. && make -j$(nproc)
 ./build/startracker <image.png> <catalog_stars.bin> <catalog_pairs.bin> [fov_deg]
 ```
 
+Pass `--benchmark` (any position) to emit per-stage `[bench] stage=... us=...`
+timing lines on stdout. `tools/benchmark.py` aggregates these across the
+real-image fixtures and writes a CSV with median / p95 per stage.
+
 ## Generate Catalog and Test Data
 
 ```bash
