@@ -86,4 +86,4 @@ def generate_database(max_mag=6.0, fov_max=25.0):
 if __name__ == "__main__":
     script_dir = os.path.dirname(os.path.abspath(__file__))
     os.chdir(script_dir)
-    generate_database(max_mag=6.0, fov_max=25.0)
+    generate_database(max_mag=7.0, fov_max=25.0)

@@ -7,7 +7,7 @@ from scipy.spatial.transform import Rotation as R
 from astroquery.vizier import Vizier
 import astropy.units as u
 
-def fetch_hipparcos(max_mag=6.0):
+def fetch_hipparcos(max_mag=7.0):
     """
     Fetches the Hipparcos catalog from Vizier, keeping stars brighter than max_mag.
     Uses caching to avoid repeated downloads.

@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 
 StarDatabase::StarDatabase(const std::string &star_file,
@@ -42,8 +43,38 @@ StarDatabase::StarDatabase(const std::string &star_file,
     pairs[i] = {cos_val, id1, id2};
   }
 
+  // Build per-star partner index for pyramid-style identification expansion.
+  per_star_partners.reserve(num_stars);
+  for (const auto &p : pairs) {
+    per_star_partners[p.id1].emplace_back(p.cos_val, p.id2);
+    per_star_partners[p.id2].emplace_back(p.cos_val, p.id1);
+  }
+  for (auto &kv : per_star_partners) {
+    std::sort(kv.second.begin(), kv.second.end());
+  }
+
   std::cout << "Loaded database: " << num_stars << " stars, " << num_pairs
             << " pairs.\n";
+}
+
+std::vector<int> StarDatabase::find_partners(int hip, double cos_target,
+                                             double cos_tolerance) const {
+  std::vector<int> result;
+  auto it = per_star_partners.find(hip);
+  if (it == per_star_partners.end())
+    return result;
+  const auto &lst = it->second;
+  // Sorted ascending by cos. Find range [cos_target - tol, cos_target + tol].
+  auto lo = std::lower_bound(
+      lst.begin(), lst.end(),
+      std::make_pair(cos_target - cos_tolerance, std::numeric_limits<int>::min()));
+  auto hi = std::upper_bound(
+      lst.begin(), lst.end(),
+      std::make_pair(cos_target + cos_tolerance, std::numeric_limits<int>::max()));
+  result.reserve(static_cast<size_t>(hi - lo));
+  for (auto p = lo; p != hi; ++p)
+    result.push_back(p->second);
+  return result;
 }
 
 std::vector<CatalogPair> StarDatabase::find_pairs(double cos_target,

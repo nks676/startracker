@@ -16,5 +16,8 @@ tools/venv/
 # Runtime output
 result.txt
 
+# Secrets
+.env
+
 # macOS
 .DS_Store

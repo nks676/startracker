@@ -12,9 +12,9 @@
 
 int main(int argc, char **argv) {
   if (argc < 4) {
-    std::cerr
-        << "Usage: " << argv[0]
-        << " <image.png> <catalog_stars.bin> <catalog_pairs.bin> [fov_deg]\n";
+    std::cerr << "Usage: " << argv[0]
+              << " <image.png> <catalog_stars.bin> <catalog_pairs.bin> "
+                 "[fov_deg] [cos_tol]\n";
     return 1;
   }
 
@@ -22,6 +22,7 @@ int main(int argc, char **argv) {
   std::string star_path = argv[2];
   std::string pair_path = argv[3];
   double fov_deg = (argc >= 5) ? std::stod(argv[4]) : 20.0;
+  double cos_tol = (argc >= 6) ? std::stod(argv[5]) : 1e-5;
 
   // Load Image
   int width, height, channels;
@@ -52,13 +53,6 @@ int main(int argc, char **argv) {
 
   camera.focal_x = width / (2.0 * std::tan(fov_deg * M_PI / 180.0 / 2.0));
   camera.focal_y = camera.focal_x; // square pixels
-
-  // cos_tol drives catalog pair matching during voting.
-  // With f ≈ width/(2*tan(fov/2)) and ~0.1-px centroid noise, a star-pair at
-  // angle θ produces a cosine error of ~sin(θ)*√2*(0.1/f).  For θ=10° and
-  // f=2903 px that's ~8.5e-6, so 1e-5 gives a comfortable safety margin while
-  // keeping false-match density low enough for the voting threshold to hold.
-  double cos_tol = 1e-5;
 
   auto identified = identify_stars(centroids, camera, db, cos_tol);
   std::cout << "Identified " << identified.size() << " stars.\n";
