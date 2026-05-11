@@ -100,19 +100,63 @@ bool passes_filter(int pixel_count, int bbox_w, int bbox_h, int bbox_x0,
   return true;
 }
 
+// Iterative Gaussian-weighted refinement. Initial guess (cx, cy) is the CoG
+// already computed from `pixels`. We run a fixed number of iterations of
+// intensity * Gaussian-weighted moments, which converges to the true Gaussian
+// peak for well-sampled PSFs and is robust to small saturated cores.
+//
+// sigma = 1.0 px is appropriate for typical star tracker PSFs (~1-1.5 px
+// FWHM). The Gaussian weight suppresses pixels far from the current estimate,
+// removing the CoG's bias toward asymmetric component pixels (e.g. dim halo
+// pixels on one side of the bright core).
+struct PixelSample {
+  int x;
+  int y;
+  double i;
+};
+
+inline void refine_gaussian(const std::vector<PixelSample> &pixels, double &cx,
+                            double &cy) {
+  constexpr int kIterations = 4;
+  constexpr double kSigma = 1.0;
+  const double inv_two_sigma_sq = 1.0 / (2.0 * kSigma * kSigma);
+  for (int iter = 0; iter < kIterations; ++iter) {
+    double sw_x = 0.0, sw_y = 0.0, sw = 0.0;
+    for (const auto &p : pixels) {
+      double dx = p.x - cx;
+      double dy = p.y - cy;
+      double w = std::exp(-(dx * dx + dy * dy) * inv_two_sigma_sq);
+      double iw = p.i * w;
+      sw_x += p.x * iw;
+      sw_y += p.y * iw;
+      sw += iw;
+    }
+    if (sw <= 0.0)
+      return; // keep previous estimate; weights collapsed
+    cx = sw_x / sw;
+    cy = sw_y / sw;
+  }
+}
+
 // Shared BFS-driven centroid extractor. `is_above_threshold(idx)` decides
 // per-pixel membership so the caller can plug in either a constant threshold
-// or a precomputed per-pixel adaptive threshold.
+// or a precomputed per-pixel adaptive threshold. When `gaussian_refine` is
+// true, each component's CoG is refined by intensity * Gaussian-weighted
+// moments (see refine_gaussian). `peak` is always populated.
 template <typename Predicate>
 std::vector<StarCentroid> extract_centroids_impl(const uint8_t *image,
                                                  int width, int height,
                                                  Predicate is_above,
-                                                 const CentroidFilterParams &f) {
+                                                 const CentroidFilterParams &f,
+                                                 bool gaussian_refine = false) {
   std::vector<StarCentroid> centroids;
   std::vector<uint8_t> visited(static_cast<size_t>(width) * height, 0);
 
   static const int dx[] = {-1, 0, 1, -1, 1, -1, 0, 1};
   static const int dy[] = {-1, -1, -1, 0, 0, 1, 1, 1};
+
+  // Reused across components when refinement is on, to avoid reallocating.
+  std::vector<PixelSample> pixels;
 
   for (int y = 0; y < height; ++y) {
     for (int x = 0; x < width; ++x) {
@@ -125,8 +169,11 @@ std::vector<StarCentroid> extract_centroids_impl(const uint8_t *image,
       visited[idx] = 1;
 
       double sum_x = 0, sum_y = 0, sum_i = 0;
+      double peak = 0.0;
       int pixel_count = 0;
       int bx0 = x, by0 = y, bx1 = x, by1 = y;
+      if (gaussian_refine)
+        pixels.clear();
 
       while (!q.empty()) {
         auto [cx, cy] = q.front();
@@ -136,11 +183,15 @@ std::vector<StarCentroid> extract_centroids_impl(const uint8_t *image,
         sum_x += cx * intensity;
         sum_y += cy * intensity;
         sum_i += intensity;
+        if (intensity > peak)
+          peak = intensity;
         pixel_count++;
         bx0 = std::min(bx0, cx);
         by0 = std::min(by0, cy);
         bx1 = std::max(bx1, cx);
         by1 = std::max(by1, cy);
+        if (gaussian_refine)
+          pixels.push_back(PixelSample{cx, cy, intensity});
 
         for (int n = 0; n < 8; ++n) {
           int nx = cx + dx[n];
@@ -163,8 +214,13 @@ std::vector<StarCentroid> extract_centroids_impl(const uint8_t *image,
                          height, f))
         continue;
 
-      centroids.push_back(
-          StarCentroid{sum_x / sum_i, sum_y / sum_i, sum_i});
+      double cx_out = sum_x / sum_i;
+      double cy_out = sum_y / sum_i;
+      if (gaussian_refine) {
+        refine_gaussian(pixels, cx_out, cy_out);
+      }
+
+      centroids.push_back(StarCentroid{cx_out, cy_out, sum_i, peak});
     }
   }
   return centroids;
@@ -215,17 +271,14 @@ std::vector<uint8_t> subtract_background(const uint8_t *image, int width,
   return out;
 }
 
-std::vector<StarCentroid>
-extract_centroids(const uint8_t *image_data, int width, int height,
-                  uint8_t threshold, const CentroidFilterParams &filter) {
-  auto is_above = [&](int idx) { return image_data[idx] > threshold; };
-  return extract_centroids_impl(image_data, width, height, is_above, filter);
-}
+namespace {
 
-std::vector<StarCentroid>
-extract_centroids_adaptive(const uint8_t *image, int width, int height,
-                           double k_sigma, int tile_size,
-                           const CentroidFilterParams &filter) {
+// Build the per-pixel adaptive threshold buffer used by both the CoG and
+// Gaussian-refined adaptive extractors. Factored out of the public function
+// bodies so the two share the (non-trivial) preprocessing exactly.
+std::vector<float> build_adaptive_threshold(const uint8_t *image, int width,
+                                            int height, double k_sigma,
+                                            int tile_size) {
   if (tile_size < 1)
     tile_size = 1;
   int n_tx = tile_count(width, tile_size);
@@ -266,7 +319,7 @@ extract_centroids_adaptive(const uint8_t *image, int width, int height,
     }
   }
 
-  // Precompute per-pixel threshold. Memory cost is W*H doubles (~8 MB on a
+  // Precompute per-pixel threshold. Memory cost is W*H floats (~4 MB on a
   // 1024x1024 image); acceptable, and lets the BFS predicate stay branch-free.
   std::vector<float> thr(static_cast<size_t>(width) * height, 0.f);
   for (int y = 0; y < height; ++y) {
@@ -278,9 +331,47 @@ extract_centroids_adaptive(const uint8_t *image, int width, int height,
       thr[y * width + x] = static_cast<float>(m + k_sigma * s);
     }
   }
+  return thr;
+}
 
+} // namespace
+
+std::vector<StarCentroid>
+extract_centroids(const uint8_t *image_data, int width, int height,
+                  uint8_t threshold, const CentroidFilterParams &filter) {
+  auto is_above = [&](int idx) { return image_data[idx] > threshold; };
+  return extract_centroids_impl(image_data, width, height, is_above, filter,
+                                /*gaussian_refine=*/false);
+}
+
+std::vector<StarCentroid>
+extract_centroids_gaussian(const uint8_t *image_data, int width, int height,
+                           uint8_t threshold,
+                           const CentroidFilterParams &filter) {
+  auto is_above = [&](int idx) { return image_data[idx] > threshold; };
+  return extract_centroids_impl(image_data, width, height, is_above, filter,
+                                /*gaussian_refine=*/true);
+}
+
+std::vector<StarCentroid>
+extract_centroids_adaptive(const uint8_t *image, int width, int height,
+                           double k_sigma, int tile_size,
+                           const CentroidFilterParams &filter) {
+  auto thr = build_adaptive_threshold(image, width, height, k_sigma, tile_size);
   auto is_above = [&](int idx) {
     return static_cast<double>(image[idx]) > thr[idx];
   };
-  return extract_centroids_impl(image, width, height, is_above, filter);
+  return extract_centroids_impl(image, width, height, is_above, filter,
+                                /*gaussian_refine=*/false);
+}
+
+std::vector<StarCentroid> extract_centroids_adaptive_gaussian(
+    const uint8_t *image, int width, int height, double k_sigma, int tile_size,
+    const CentroidFilterParams &filter) {
+  auto thr = build_adaptive_threshold(image, width, height, k_sigma, tile_size);
+  auto is_above = [&](int idx) {
+    return static_cast<double>(image[idx]) > thr[idx];
+  };
+  return extract_centroids_impl(image, width, height, is_above, filter,
+                                /*gaussian_refine=*/true);
 }

@@ -6,6 +6,10 @@ struct StarCentroid {
   double x;
   double y;
   double intensity;
+  // Peak (max) pixel intensity in the connected component. Used by main.cpp's
+  // CENTROID_CAP ranking: peak is robust to saturated blobs that inflate the
+  // intensity (sum) metric. Always populated by extract_centroids* APIs.
+  double peak = 0.0;
 };
 
 // Shape/size filter parameters applied to connected components by both the
@@ -39,6 +43,22 @@ extract_centroids(const uint8_t *image_data, int width, int height,
 // Connected components use the same 8-connected BFS as extract_centroids and
 // the same CentroidFilterParams shape/size filters are applied.
 std::vector<StarCentroid> extract_centroids_adaptive(
+    const uint8_t *image, int width, int height, double k_sigma = 5.0,
+    int tile_size = 64,
+    const CentroidFilterParams &filter = CentroidFilterParams{});
+
+// Like extract_centroids but refines each centroid with 3-5 iterations of
+// intensity * Gaussian-weighted moments, initialized from the CoG. Sigma is
+// fixed at 1.0 px which is appropriate for typical star tracker PSFs.
+// Sub-pixel accuracy improves from ~0.1 px (CoG) to ~0.01-0.05 px on
+// well-sampled Gaussian PSFs. The `peak` field is populated.
+std::vector<StarCentroid> extract_centroids_gaussian(
+    const uint8_t *image_data, int width, int height, uint8_t threshold,
+    const CentroidFilterParams &filter = CentroidFilterParams{});
+
+// Like extract_centroids_adaptive but with Gaussian-weighted iterative
+// refinement after BFS (see extract_centroids_gaussian).
+std::vector<StarCentroid> extract_centroids_adaptive_gaussian(
     const uint8_t *image, int width, int height, double k_sigma = 5.0,
     int tile_size = 64,
     const CentroidFilterParams &filter = CentroidFilterParams{});

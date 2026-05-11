@@ -239,3 +239,100 @@ TEST(ImageProcessingTest, AdaptiveRejectsEdgeObject) {
   auto centroids = extract_centroids_adaptive(img.data(), W, H, 5.0, 16);
   EXPECT_EQ(centroids.size(), 0u);
 }
+
+// --- Gaussian centroiding tests (3b.1) ---
+
+// Helper: paint a Gaussian PSF at sub-pixel (cx, cy) with given sigma and
+// amplitude. Writes into a 7x7 neighborhood; pixels outside the image are
+// silently dropped.
+static void paint_gaussian(std::vector<uint8_t> &img, int w, int h, double cx,
+                           double cy, double sigma, double amplitude) {
+  int x0 = std::max(0, static_cast<int>(std::floor(cx - 3)));
+  int x1 = std::min(w - 1, static_cast<int>(std::ceil(cx + 3)));
+  int y0 = std::max(0, static_cast<int>(std::floor(cy - 3)));
+  int y1 = std::min(h - 1, static_cast<int>(std::ceil(cy + 3)));
+  double inv = 1.0 / (2.0 * sigma * sigma);
+  for (int y = y0; y <= y1; ++y) {
+    for (int x = x0; x <= x1; ++x) {
+      double dx = x - cx;
+      double dy = y - cy;
+      double v = amplitude * std::exp(-(dx * dx + dy * dy) * inv);
+      int pv = static_cast<int>(std::lround(v));
+      img[y * w + x] = static_cast<uint8_t>(std::clamp(pv, 0, 255));
+    }
+  }
+}
+
+TEST(ImageProcessingTest, GaussianRefinesSubPixelCentroid) {
+  const int W = 64, H = 64;
+  const double truth_x = 16.3, truth_y = 16.7;
+  auto img = make_blank(W, H);
+  // Sigma=1.0 px PSF; amplitude 200 with threshold=70 leaves an asymmetric
+  // truncated support around the peak. CoG biases noticeably toward the
+  // integer grid; the intensity*Gaussian iteration pulls back to the true
+  // center. This is the regime real star tracker pipelines see — the
+  // threshold is well above the PSF wings, so the centroid sees only the
+  // bright core.
+  paint_gaussian(img, W, H, truth_x, truth_y, 1.0, 200.0);
+
+  auto gauss = extract_centroids_gaussian(img.data(), W, H, 70);
+  ASSERT_EQ(gauss.size(), 1u);
+  double gauss_err = std::hypot(gauss[0].x - truth_x, gauss[0].y - truth_y);
+  EXPECT_LT(gauss_err, 0.05)
+      << "Gaussian centroid error too large: " << gauss_err;
+
+  auto cog = extract_centroids(img.data(), W, H, 70);
+  ASSERT_EQ(cog.size(), 1u);
+  double cog_err = std::hypot(cog[0].x - truth_x, cog[0].y - truth_y);
+  EXPECT_GT(cog_err, 0.05)
+      << "CoG should have noticeable sub-pixel error on a non-integer-center "
+         "Gaussian; got "
+      << cog_err;
+
+  // Gaussian must beat CoG.
+  EXPECT_LT(gauss_err, cog_err);
+
+  // Peak field is populated. The brightest sampled pixel of a sub-pixel-
+  // centered Gaussian is below the analytic amplitude (sampling is at the
+  // integer-grid nearest neighbor), so allow a comfortable floor.
+  EXPECT_GT(gauss[0].peak, 150.0);
+  EXPECT_LE(gauss[0].peak, 200.0);
+}
+
+TEST(ImageProcessingTest, PeakReflectsBrightestPixelInComponent) {
+  const int W = 32, H = 32;
+  auto img = make_blank(W, H);
+
+  // 5x5 plateau of 255 starting at (10,10) — saturated core.
+  for (int y = 10; y < 15; ++y) {
+    for (int x = 10; x < 15; ++x) {
+      img[y * W + x] = 255;
+    }
+  }
+  // Adjacent halo pixel at lower intensity to enlarge the component without
+  // exceeding the max-pixels filter (5x5 plateau + 1 = 26 pixels, well under
+  // the default max_pixels=200).
+  img[10 * W + 15] = 200;
+
+  auto centroids = extract_centroids(img.data(), W, H, 100);
+  ASSERT_EQ(centroids.size(), 1u);
+  // Peak must equal 255 (the saturated core).
+  EXPECT_DOUBLE_EQ(centroids[0].peak, 255.0);
+  // Intensity (sum) should be well above peak — sanity check the struct.
+  EXPECT_GT(centroids[0].intensity, centroids[0].peak);
+
+  // Same expectation for the Gaussian extractor.
+  auto gauss = extract_centroids_gaussian(img.data(), W, H, 100);
+  ASSERT_EQ(gauss.size(), 1u);
+  EXPECT_DOUBLE_EQ(gauss[0].peak, 255.0);
+
+  // And the adaptive variants.
+  auto adaptive = extract_centroids_adaptive(img.data(), W, H, 5.0, 16);
+  ASSERT_GE(adaptive.size(), 1u);
+  EXPECT_DOUBLE_EQ(adaptive[0].peak, 255.0);
+
+  auto adaptive_g =
+      extract_centroids_adaptive_gaussian(img.data(), W, H, 5.0, 16);
+  ASSERT_GE(adaptive_g.size(), 1u);
+  EXPECT_DOUBLE_EQ(adaptive_g[0].peak, 255.0);
+}
