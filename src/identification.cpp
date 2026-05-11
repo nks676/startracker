@@ -104,7 +104,7 @@ run_pyramid(const std::vector<std::array<double, 3>> &v_cam,
   for (int i = 0; i < N; ++i) {
     for (int j = i + 1; j < N; ++j) {
       double obs_ij = dot3(v_cam[i], v_cam[j]);
-      auto seeds = db.find_pairs(obs_ij, cos_tolerance);
+      auto seeds = db.find_pairs_kvec(obs_ij, cos_tolerance);
       for (const auto &seed : seeds) {
         // Try both orientations: i=id1/j=id2 AND i=id2/j=id1.
         for (int swap = 0; swap < 2; ++swap) {
