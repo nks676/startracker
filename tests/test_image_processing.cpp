@@ -77,3 +77,165 @@ TEST(ImageProcessingTest, NoiseRejection) {
   auto centroids = extract_centroids(img.data(), W, H, 100);
   EXPECT_EQ(centroids.size(), 0u);
 }
+
+// --- Background subtraction tests ---
+
+TEST(ImageProcessingTest, SubtractBackgroundGradientPreservesStars) {
+  const int W = 256, H = 256;
+  std::vector<uint8_t> img(W * H, 0);
+
+  // bg(x,y) = 30 + (x/4) — ramps 30..94 left to right.
+  for (int y = 0; y < H; ++y) {
+    for (int x = 0; x < W; ++x) {
+      img[y * W + x] = static_cast<uint8_t>(30 + (x / 4));
+    }
+  }
+
+  // Three bright 3x3 spots well inside the border margin (>=5 px from edge).
+  struct Pt {
+    int x, y;
+  };
+  Pt truth[3] = {{40, 40}, {128, 128}, {200, 200}};
+  for (auto p : truth) {
+    paint_spot(img, W, p.x, p.y, 230, 200);
+  }
+
+  auto bg_sub = subtract_background(img.data(), W, H, 64);
+
+  // Far from any star, background should be near zero (within a few ADU).
+  EXPECT_LT(bg_sub[10 * W + 220], 10);
+
+  auto centroids = extract_centroids(bg_sub.data(), W, H, 50);
+  ASSERT_EQ(centroids.size(), 3u);
+
+  // Sort by x so we can compare in deterministic order.
+  std::sort(centroids.begin(), centroids.end(),
+            [](const StarCentroid &a, const StarCentroid &b) {
+              return a.x < b.x;
+            });
+  for (size_t i = 0; i < 3; ++i) {
+    EXPECT_NEAR(centroids[i].x, truth[i].x, 0.5);
+    EXPECT_NEAR(centroids[i].y, truth[i].y, 0.5);
+  }
+}
+
+TEST(ImageProcessingTest, SubtractBackgroundFlatImageGoesToZero) {
+  const int W = 128, H = 128;
+  std::vector<uint8_t> img(W * H, 50);
+  auto bg_sub = subtract_background(img.data(), W, H, 64);
+  // Should be uniformly near 0 (median of 50 is exactly 50 -> result 0).
+  for (auto v : bg_sub) {
+    EXPECT_LE(static_cast<int>(v), 2);
+  }
+}
+
+// --- Adaptive thresholding tests ---
+
+TEST(ImageProcessingTest, AdaptiveHandlesSplitBackground) {
+  const int W = 128, H = 128;
+  std::vector<uint8_t> img(W * H, 0);
+
+  // Left half background 20, right half 120 (sigma ~ 5).
+  std::mt19937 rng(7);
+  std::normal_distribution<double> nL(20.0, 5.0);
+  std::normal_distribution<double> nR(120.0, 5.0);
+  for (int y = 0; y < H; ++y) {
+    for (int x = 0; x < W; ++x) {
+      double v = (x < W / 2) ? nL(rng) : nR(rng);
+      img[y * W + x] = static_cast<uint8_t>(std::clamp(v, 0.0, 255.0));
+    }
+  }
+  // Paint two spots — one on each half. Center intensity = bg + ~60,
+  // neighbors = bg + ~40. With sigma=5, the right-half spot (peak ~180) is
+  // well above the right-half local threshold (~120 + 4*5 = 140); the
+  // left-half spot (peak ~80) is well above local (~20+4*5=40) but a fixed
+  // threshold=100 misses it entirely.
+  paint_spot(img, W, 32, 64, 80, 60);
+  paint_spot(img, W, 96, 64, 180, 160);
+
+  auto centroids = extract_centroids_adaptive(img.data(), W, H, 4.0, 32);
+
+  // Should find both spots.
+  ASSERT_GE(centroids.size(), 2u);
+
+  bool found_left = false, found_right = false;
+  for (const auto &c : centroids) {
+    if (std::abs(c.x - 32) < 1.5 && std::abs(c.y - 64) < 1.5)
+      found_left = true;
+    if (std::abs(c.x - 96) < 1.5 && std::abs(c.y - 64) < 1.5)
+      found_right = true;
+  }
+  EXPECT_TRUE(found_left);
+  EXPECT_TRUE(found_right);
+
+  // Verify fixed-threshold=100 misses the left-half spot (regression on the
+  // motivation for adaptive thresholding).
+  auto fixed = extract_centroids(img.data(), W, H, 100);
+  bool fixed_found_left = false;
+  for (const auto &c : fixed) {
+    if (std::abs(c.x - 32) < 2.0 && std::abs(c.y - 64) < 2.0)
+      fixed_found_left = true;
+  }
+  EXPECT_FALSE(fixed_found_left);
+}
+
+TEST(ImageProcessingTest, AdaptiveMatchesFixedOnUniformBackground) {
+  const int W = 128, H = 128;
+  std::vector<uint8_t> img(W * H, 0);
+  // Low uniform background, three well-separated spots inset from the edge.
+  std::mt19937 rng(11);
+  std::uniform_int_distribution<int> bg_dist(10, 20);
+  for (auto &px : img)
+    px = static_cast<uint8_t>(bg_dist(rng));
+  paint_spot(img, W, 30, 30);
+  paint_spot(img, W, 64, 80);
+  paint_spot(img, W, 100, 30);
+
+  auto fixed = extract_centroids(img.data(), W, H, 100);
+  auto adaptive = extract_centroids_adaptive(img.data(), W, H, 5.0, 32);
+
+  ASSERT_EQ(fixed.size(), 3u);
+  ASSERT_EQ(adaptive.size(), 3u);
+
+  auto sort_xy = [](std::vector<StarCentroid> &v) {
+    std::sort(v.begin(), v.end(),
+              [](const StarCentroid &a, const StarCentroid &b) {
+                return a.x < b.x;
+              });
+  };
+  sort_xy(fixed);
+  sort_xy(adaptive);
+  for (size_t i = 0; i < 3; ++i) {
+    EXPECT_NEAR(fixed[i].x, adaptive[i].x, 1.0);
+    EXPECT_NEAR(fixed[i].y, adaptive[i].y, 1.0);
+  }
+}
+
+// --- Shape filter tests (apply to both APIs) ---
+
+TEST(ImageProcessingTest, AdaptiveRejectsSingleHotPixel) {
+  const int W = 32, H = 32;
+  std::vector<uint8_t> img(W * H, 0);
+  img[16 * W + 16] = 255;
+  auto centroids = extract_centroids_adaptive(img.data(), W, H, 5.0, 16);
+  EXPECT_EQ(centroids.size(), 0u);
+}
+
+TEST(ImageProcessingTest, AdaptiveRejectsStreak) {
+  const int W = 32, H = 32;
+  std::vector<uint8_t> img(W * H, 0);
+  // 1 px tall x 10 px wide bright stripe — aspect ratio 10 > 3.
+  for (int x = 11; x < 21; ++x)
+    img[16 * W + x] = 220;
+  auto centroids = extract_centroids_adaptive(img.data(), W, H, 5.0, 16);
+  EXPECT_EQ(centroids.size(), 0u);
+}
+
+TEST(ImageProcessingTest, AdaptiveRejectsEdgeObject) {
+  const int W = 32, H = 32;
+  std::vector<uint8_t> img(W * H, 0);
+  // 3x3 spot centered at (2, 16) — bbox x0=1 is within the 5px border margin.
+  paint_spot(img, W, 2, 16, 220, 180);
+  auto centroids = extract_centroids_adaptive(img.data(), W, H, 5.0, 16);
+  EXPECT_EQ(centroids.size(), 0u);
+}
