@@ -1,0 +1,14 @@
+{
+  "quaternion_xyzw": [
+    -0.06420850926357337,
+    -0.6325556428679738,
+    0.6433486005854201,
+    -0.4264424980449481
+  ],
+  "fov_horizontal_deg": 11.448760463483342,
+  "image_width_px": 1024,
+  "image_height_px": 768,
+  "source_url": "https://raw.githubusercontent.com/esa/tetra3/master/examples/data/2019-07-29T204726_Alt40_Azi-135_Try1.tiff",
+  "attitude_tolerance_deg": 0.5,
+  "description": "ESA tetra3 sample: FLIR Blackfly S BFS-U3-31S4M-C + Fujifilm HF35XA-5M 35mm f/1.9, 2x2 binned IMX265, alt 40 azi -135. Truth via nova.astrometry.net."
+}

@@ -33,5 +33,8 @@ jobs:
       - name: Full Pipeline Test
         run: bash tests/test_full_pipeline.sh
 
+      - name: Real-image Regression
+        run: bash tests/test_real_images.sh
+
       - name: Monte Carlo Validation
         run: bash tests/test_monte_carlo.sh

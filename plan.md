@@ -337,12 +337,18 @@ Source real star field images and integrate them into testing.
 
 #### Phase 3a Checklist
 
-- [ ] 3a.1: Camera distortion model (Brown-Conrady)
-- [ ] 3a.2: Background subtraction
-- [ ] 3a.3: Adaptive thresholding
-- [ ] 3a.4: Hot pixel / outlier rejection
-- [ ] 3a.5: Real image test pipeline
-- [ ] Monte Carlo success rate ≥ 85%
+- [x] 3a.0: Catalog mag cutoff 6.0 → 7.0 (added during smoke test)
+- [x] 3a.1: Camera distortion model (Brown-Conrady)
+- [x] 3a.2: Background subtraction
+- [x] 3a.3: Adaptive thresholding
+- [x] 3a.4: Hot pixel / outlier rejection
+- [x] 3a.5: Real image test pipeline (tools/test_real_images.py, in CI)
+- [x] Bonus (moved from 3b.3): pyramid identification — direct catalog
+      pair search + geometric expansion. Vote-based prefiltering was
+      structurally biased toward dense sky regions; pyramid expansion
+      uses StarDatabase::find_partners for O(log P) seed extension.
+- [x] Monte Carlo success rate ≥ 85% — actually 100% (median 0.008°)
+- Real-image regression: Alt40 0.04°, Alt60 0.00° (ESA tetra3 samples)
 
 ---
 
