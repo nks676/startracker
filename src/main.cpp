@@ -49,7 +49,8 @@ int main(int argc, char **argv) {
 
   // 1. Image Processing — adaptive per-tile thresholding handles varying
   // backgrounds across the frame (vignetting, light pollution, sensor glow).
-  auto centroids = extract_centroids_adaptive(image_data, width, height);
+  auto centroids =
+      extract_centroids_adaptive_gaussian(image_data, width, height);
   std::cout << "Extracted " << centroids.size() << " centroids.\n";
   stbi_image_free(image_data);
 
@@ -57,15 +58,18 @@ int main(int argc, char **argv) {
   // (catalog cutoff Vmag<7, sensors reach ~Vmag 8-9). Keep only the
   // brightest CENTROID_CAP — non-catalog faint stars can't be identified
   // anyway, and the pyramid's combinatorics scale ~ N^2 per seed-pair check.
-  constexpr size_t CENTROID_CAP = 25;
+  // Rank by peak (max pixel value in the component) rather than intensity
+  // (sum): 8-bit saturated blobs inflate sum but cap peak at 255, so peak
+  // gives a more honest brightness ordering when stars saturate.
+  constexpr size_t CENTROID_CAP = 60;
   if (centroids.size() > CENTROID_CAP) {
     std::partial_sort(centroids.begin(), centroids.begin() + CENTROID_CAP,
                       centroids.end(),
                       [](const StarCentroid &a, const StarCentroid &b) {
-                        return a.intensity > b.intensity;
+                        return a.peak > b.peak;
                       });
     centroids.resize(CENTROID_CAP);
-    std::cout << "Kept top " << CENTROID_CAP << " by intensity.\n";
+    std::cout << "Kept top " << CENTROID_CAP << " by peak intensity.\n";
   }
 
   // 2. Load Catalog
