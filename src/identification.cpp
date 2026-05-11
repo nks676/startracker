@@ -43,13 +43,17 @@ identify_stars(const std::vector<StarCentroid> &image_stars,
   //      self-consistent assignment.
 
   // Cache catalog unit vectors (one per HIP) to avoid repeated map lookups.
+  // Returns by value: holding a reference into an unordered_map across a
+  // subsequent insert would be UB on rehash.
   std::unordered_map<int, std::array<double, 3>> cat_vec_cache;
-  auto cat_vec = [&](int hip) -> const std::array<double, 3> & {
+  auto cat_vec = [&](int hip) -> std::array<double, 3> {
     auto it = cat_vec_cache.find(hip);
     if (it != cat_vec_cache.end())
       return it->second;
     CatalogStar s = db.get_star(hip);
-    return cat_vec_cache[hip] = {s.x, s.y, s.z};
+    std::array<double, 3> v = {s.x, s.y, s.z};
+    cat_vec_cache[hip] = v;
+    return v;
   };
 
   std::vector<int> best_assignment(N, -1);
@@ -67,8 +71,8 @@ identify_stars(const std::vector<StarCentroid> &image_stars,
           if (A == B)
             continue;
 
-          const auto &va = cat_vec(A);
-          const auto &vb = cat_vec(B);
+          const auto va = cat_vec(A);
+          const auto vb = cat_vec(B);
 
           std::vector<int> assign(N, -1);
           std::unordered_set<int> used;
@@ -90,7 +94,7 @@ identify_stars(const std::vector<StarCentroid> &image_stars,
             for (int C : candidates_C) {
               if (used.count(C))
                 continue;
-              const auto &vc = cat_vec(C);
+              const auto vc = cat_vec(C);
               double cat_bc = dot3(vb, vc);
               double err = std::abs(cat_bc - obs_jk);
               if (err < best_err) {

@@ -1,4 +1,5 @@
 #include "catalog.h"
+#include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <gtest/gtest.h>
@@ -71,4 +72,31 @@ TEST_F(CatalogTest, FindPairsEmptyOnZeroTolerance) {
   // cos_val = 0.12345 is unlikely to be an exact match for any pair
   auto pairs = db->find_pairs(0.12345, 0.0);
   EXPECT_EQ(pairs.size(), 0u);
+}
+
+TEST_F(CatalogTest, FindPartnersIncludesKnownPair) {
+  // Querying Castor's partners at the true cos(Castor, Pollux) angle should
+  // return Pollux (along with any other stars at that angular separation).
+  CatalogStar castor = db->get_star(36850);
+  CatalogStar pollux = db->get_star(37826);
+  double cos_true =
+      castor.x * pollux.x + castor.y * pollux.y + castor.z * pollux.z;
+
+  auto partners = db->find_partners(36850, cos_true, 1e-4);
+  EXPECT_GT(partners.size(), 0u);
+  EXPECT_NE(std::find(partners.begin(), partners.end(), 37826), partners.end())
+      << "Expected Pollux (HIP 37826) in Castor's partner list at the right "
+         "cosine separation";
+}
+
+TEST_F(CatalogTest, FindPartnersUnknownHipReturnsEmpty) {
+  auto partners = db->find_partners(999999, 0.5, 1e-4);
+  EXPECT_EQ(partners.size(), 0u);
+}
+
+TEST_F(CatalogTest, FindPartnersRespectsTolerance) {
+  // With a tight tolerance and a cos value unlikely to land on any real pair,
+  // we should get no partners.
+  auto partners = db->find_partners(36850, 0.12345, 1e-12);
+  EXPECT_EQ(partners.size(), 0u);
 }
