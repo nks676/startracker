@@ -53,43 +53,53 @@ def fetch_hipparcos(max_mag=7.0):
     print(f"Loaded {len(hip_ids)} stars and cached to {cache_file}.")
     return data
 
-def generate_image(catalog, quat, resolution, fov_deg, noise_std, output_dir):
+def generate_image(catalog, quat, resolution, fov_deg, noise_std, output_dir,
+                   distortion=(0.0, 0.0, 0.0, 0.0, 0.0)):
     """
     Generates a synthetic star tracker image.
     quat: [x, y, z, w] quaternion transforming INERTIAL to CAMERA frame.
+    distortion: Brown-Conrady coefficients (k1, k2, p1, p2, k3). Defaults to
+        zero distortion, i.e. pure pinhole — identical to legacy behavior.
     """
     rot = R.from_quat(quat)
-    
+
     # Calculate focal length in pixels using FOV
     # fov_deg is the horizontal FoV usually, let's assume it's diagonal or width.
     # width_pixels = resolution[0]
     # fov = 2 * arctan( width / (2 * f) )  => f = width / (2 * tan(fov/2))
     width, height = resolution
     f_pixels = width / (2 * np.tan(np.radians(fov_deg) / 2))
-    
+
     cx, cy = width / 2.0, height / 2.0
-    
+
     vectors = catalog['vectors']
     vmag = catalog['vmag']
     hip = catalog['hip']
-    
+
     # Transform inertial to camera
     # If quat transforms inertial IN to camera, then v_cam = R * v_inertial
     cam_vectors = rot.apply(vectors)
-    
+
     # Filter stars behind the camera (Z <= 0)
     # Our camera frame convention: Z is optical axis (+), X is right, Y is down
     front_mask = cam_vectors[:, 2] > 0
     cam_vectors = cam_vectors[front_mask]
     vmag = vmag[front_mask]
     hip = hip[front_mask]
-    
-    # Pinhole projection
-    x_proj = f_pixels * (cam_vectors[:, 0] / cam_vectors[:, 2])
-    y_proj = f_pixels * (cam_vectors[:, 1] / cam_vectors[:, 2])
-    
-    x_pix = x_proj + cx
-    y_pix = y_proj + cy
+
+    # Pinhole projection onto the z=1 plane.
+    x_norm = cam_vectors[:, 0] / cam_vectors[:, 2]
+    y_norm = cam_vectors[:, 1] / cam_vectors[:, 2]
+
+    # Brown-Conrady distortion (k1, k2, p1, p2, k3). All zeros => pinhole.
+    k1, k2, p1, p2, k3 = distortion
+    r2 = x_norm * x_norm + y_norm * y_norm
+    radial = 1.0 + k1 * r2 + k2 * r2 * r2 + k3 * r2 * r2 * r2
+    x_d = x_norm * radial + 2.0 * p1 * x_norm * y_norm + p2 * (r2 + 2.0 * x_norm * x_norm)
+    y_d = y_norm * radial + p1 * (r2 + 2.0 * y_norm * y_norm) + 2.0 * p2 * x_norm * y_norm
+
+    x_pix = f_pixels * x_d + cx
+    y_pix = f_pixels * y_d + cy
     
     # Filter stars outside image bounds
     margin = 10 # render margin
@@ -180,20 +190,24 @@ if __name__ == "__main__":
     parser.add_argument("--fov", type=float, default=20.0, help="Horizontal Field of View (degrees).")
     parser.add_argument("--noise", type=float, default=5.0, help="Standard deviation of Gaussian read noise.")
     parser.add_argument("--out", type=str, default="../data/test_0", help="Output directory.")
-    
+    parser.add_argument("--distortion", type=float, nargs=5, default=[0.0, 0.0, 0.0, 0.0, 0.0],
+                        metavar=("K1", "K2", "P1", "P2", "K3"),
+                        help="Brown-Conrady distortion coefficients (default: zero = pinhole).")
+
     args = parser.parse_args()
-    
+
     # Change dir to script dir for caching
     script_dir = os.path.dirname(os.path.abspath(__file__))
     os.chdir(script_dir)
-    
+
     catalog = fetch_hipparcos()
-    
+
     generate_image(
         catalog=catalog,
         quat=args.quat,
         resolution=args.res,
         fov_deg=args.fov,
         noise_std=args.noise,
-        output_dir=os.path.abspath(args.out)
+        output_dir=os.path.abspath(args.out),
+        distortion=tuple(args.distortion),
     )

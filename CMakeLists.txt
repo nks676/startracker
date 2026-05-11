@@ -34,6 +34,7 @@ add_executable(startracker_tests
     tests/test_catalog.cpp
     tests/test_identification.cpp
     tests/test_estimation.cpp
+    tests/test_camera_model.cpp
 )
 target_link_libraries(startracker_tests PRIVATE startracker_core GTest::gtest_main)
 

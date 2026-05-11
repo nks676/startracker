@@ -12,10 +12,16 @@
 #include "image_processing.h"
 
 int main(int argc, char **argv) {
-  if (argc < 4) {
-    std::cerr << "Usage: " << argv[0]
-              << " <image.png> <catalog_stars.bin> <catalog_pairs.bin> "
-                 "[fov_deg] [cos_tol]\n";
+  // Accepted argc: 4 (mandatory), 5 (+fov), 6 (+cos_tol), 11 (+all five
+  // distortion coefficients). 7..10 means a partial distortion spec, which
+  // is ambiguous so we reject it up front.
+  if (argc < 4 || (argc > 6 && argc < 11) || argc > 11) {
+    std::cerr
+        << "Usage: " << argv[0]
+        << " <image.png> <catalog_stars.bin> <catalog_pairs.bin> "
+           "[fov_deg] [cos_tol] [k1 k2 p1 p2 k3]\n"
+        << "  Distortion coefficients are all-or-nothing: pass all five or "
+           "none.\n";
     return 1;
   }
 
@@ -24,6 +30,11 @@ int main(int argc, char **argv) {
   std::string pair_path = argv[3];
   double fov_deg = (argc >= 5) ? std::stod(argv[4]) : 20.0;
   double cos_tol = (argc >= 6) ? std::stod(argv[5]) : 1e-5;
+  double k1 = (argc == 11) ? std::stod(argv[6]) : 0.0;
+  double k2 = (argc == 11) ? std::stod(argv[7]) : 0.0;
+  double p1 = (argc == 11) ? std::stod(argv[8]) : 0.0;
+  double p2 = (argc == 11) ? std::stod(argv[9]) : 0.0;
+  double k3 = (argc == 11) ? std::stod(argv[10]) : 0.0;
 
   // Load Image
   int width, height, channels;
@@ -61,7 +72,7 @@ int main(int argc, char **argv) {
   StarDatabase db(star_path, pair_path);
 
   // 3. Star Identification
-  PinholeCamera camera;
+  CameraModel camera;
   camera.frame_width = width;
   camera.frame_height = height;
   camera.center_x = width / 2.0;
@@ -69,6 +80,12 @@ int main(int argc, char **argv) {
 
   camera.focal_x = width / (2.0 * std::tan(fov_deg * M_PI / 180.0 / 2.0));
   camera.focal_y = camera.focal_x; // square pixels
+
+  camera.k1 = k1;
+  camera.k2 = k2;
+  camera.k3 = k3;
+  camera.p1 = p1;
+  camera.p2 = p2;
 
   auto identified = identify_stars(centroids, camera, db, cos_tol);
   std::cout << "Identified " << identified.size() << " stars.\n";
