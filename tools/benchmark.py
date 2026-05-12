@@ -43,7 +43,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_real_images import (  # type: ignore[import-not-found]
     REPO_ROOT,
-    download_if_missing,
+    download_if_missing,  # re-exported for back-compat; benchmark uses resolver
+    resolve_fixture_tiff,
 )
 
 
@@ -97,10 +98,8 @@ def prepare_fixture_images(work_dir: Path) -> list[tuple[str, Path, float, float
     for fx in fixtures:
         truth = json.loads(fx.read_text())
         url = truth["source_url"]
-        name = url.rsplit("/", 1)[-1]
-        tiff_path = work_dir / name
         try:
-            download_if_missing(url, tiff_path)
+            tiff_path = resolve_fixture_tiff(fx, url, work_dir)
         except Exception as e:  # noqa: BLE001 — diagnostics only
             print(f"  WARN: could not prepare {fx.stem}: {e}", file=sys.stderr)
             continue

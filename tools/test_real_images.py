@@ -44,6 +44,22 @@ def download_if_missing(url: str, dest: Path) -> None:
     urllib.request.urlretrieve(url, dest)
 
 
+def resolve_fixture_tiff(fixture_path: Path, url: str, work_dir: Path) -> Path:
+    """Locate the TIFF for a fixture, preferring a vendored copy next to the
+    JSON fixture (tests/data/real_images/<basename>). Falls back to the
+    historic cache dir (data/real_images/) and finally to a one-time URL
+    download. The vendored path is the source of truth for CI — the URL
+    fallback exists only so new fixtures can be bootstrapped locally before
+    being committed."""
+    name = url.rsplit("/", 1)[-1]
+    vendored = fixture_path.parent / name
+    if vendored.exists():
+        return vendored
+    cached = work_dir / name
+    download_if_missing(url, cached)
+    return cached
+
+
 def tiff_to_png(tiff_path: Path, png_path: Path) -> None:
     """DEPRECATED but kept as a public helper for any external caller still on
     the 8-bit path. The C++ binary now reads 16-bit TIFFs natively, so the
@@ -103,9 +119,7 @@ def run_fixture(fixture_path: Path, binary: Path, work_dir: Path) -> tuple[bool,
     cos_tol = truth.get("cos_tol")
 
     url = truth["source_url"]
-    name = url.rsplit("/", 1)[-1]
-    tiff_path = work_dir / name
-    download_if_missing(url, tiff_path)
+    tiff_path = resolve_fixture_tiff(fixture_path, url, work_dir)
 
     # 3a.6: feed the raw TIFF to the binary; it reads 16-bit grayscale TIFF
     # natively via src/tiff_reader.cpp. No PNG intermediate.
