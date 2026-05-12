@@ -94,7 +94,7 @@ int main(int argc, char **argv) {
   // Rank by peak (max pixel value in the component) rather than intensity
   // (sum): 8-bit saturated blobs inflate sum but cap peak at 255, so peak
   // gives a more honest brightness ordering when stars saturate.
-  constexpr size_t CENTROID_CAP = 60;
+  constexpr size_t CENTROID_CAP = 50;
   if (centroids.size() > CENTROID_CAP) {
     std::partial_sort(centroids.begin(), centroids.begin() + CENTROID_CAP,
                       centroids.end(),
