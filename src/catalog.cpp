@@ -1,6 +1,8 @@
 #include "catalog.h"
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -220,4 +222,155 @@ CatalogStar StarDatabase::get_star(int hip_id) const {
     return it->second;
   }
   throw std::runtime_error("Star ID not found");
+}
+
+// --- Phase 3e.2: pattern-hash catalog loader + query ---
+
+namespace {
+// Must match tools/generate_catalog.py: PATTERN_MAGIC = 0x50415431 ('PAT1').
+constexpr int32_t kPatternMagic = 0x50415431;
+constexpr int kQuantBits = 10;
+constexpr uint64_t kQuantMask = (1ULL << kQuantBits) - 1ULL;
+constexpr uint64_t kQuantMax = kQuantMask; // 1023
+} // namespace
+
+void StarDatabase::load_pattern_catalog(const std::string &pattern_file) {
+  std::ifstream fs(pattern_file, std::ios::binary);
+  if (!fs)
+    throw std::runtime_error("Could not open pattern catalog: " + pattern_file);
+
+  int32_t magic = 0;
+  int32_t fov_bin_deg = 0;
+  int32_t k_nearest = 0;
+  int32_t quant_bits = 0;
+  int32_t num_patterns = 0;
+  fs.read(reinterpret_cast<char *>(&magic), sizeof(int32_t));
+  fs.read(reinterpret_cast<char *>(&fov_bin_deg), sizeof(int32_t));
+  fs.read(reinterpret_cast<char *>(&k_nearest), sizeof(int32_t));
+  fs.read(reinterpret_cast<char *>(&quant_bits), sizeof(int32_t));
+  fs.read(reinterpret_cast<char *>(&num_patterns), sizeof(int32_t));
+  if (!fs)
+    throw std::runtime_error("Pattern catalog header read failed: " +
+                             pattern_file);
+  if (magic != kPatternMagic)
+    throw std::runtime_error("Pattern catalog bad magic: " + pattern_file);
+  if (quant_bits != kQuantBits)
+    throw std::runtime_error("Pattern catalog quant_bits mismatch (expected " +
+                             std::to_string(kQuantBits) + ", got " +
+                             std::to_string(quant_bits) + ")");
+  if (num_patterns < 0)
+    throw std::runtime_error("Pattern catalog negative num_patterns");
+
+  pattern_fov_bin_deg_ = fov_bin_deg;
+  pattern_k_nearest_ = k_nearest;
+  pattern_quant_bits_ = quant_bits;
+
+  patterns_.clear();
+  patterns_.resize(static_cast<size_t>(num_patterns));
+  for (int i = 0; i < num_patterns; ++i) {
+    StarPattern p;
+    fs.read(reinterpret_cast<char *>(&p.key), sizeof(uint64_t));
+    fs.read(reinterpret_cast<char *>(&p.hips[0]), sizeof(int32_t) * 4);
+    if (!fs)
+      throw std::runtime_error(
+          "Pattern catalog body short at index " + std::to_string(i) + " of " +
+          std::to_string(num_patterns));
+    patterns_[i] = p;
+  }
+
+  // Generator already sorts ascending by key, but verify cheaply to fail
+  // loudly on a corrupted/mis-ordered file rather than silently returning
+  // wrong results from std::lower_bound.
+  if (!std::is_sorted(patterns_.begin(), patterns_.end(),
+                      [](const StarPattern &a, const StarPattern &b) {
+                        return a.key < b.key;
+                      })) {
+    throw std::runtime_error(
+        "Pattern catalog not sorted ascending by key: " + pattern_file);
+  }
+
+  std::cout << "Loaded pattern catalog: " << pattern_file << " ("
+            << num_patterns << " patterns, fov_bin=" << fov_bin_deg
+            << "°, k=" << k_nearest << ")\n";
+}
+
+std::vector<StarPattern> StarDatabase::find_pattern(uint64_t key) const {
+  std::vector<StarPattern> out;
+  if (patterns_.empty())
+    return out;
+
+  // The vector is sorted ascending by key. equal_range gives the half-open
+  // [lo, hi) range whose keys equal `key`.
+  auto cmp_key = [](const StarPattern &p, uint64_t k) { return p.key < k; };
+  auto cmp_key_rev = [](uint64_t k, const StarPattern &p) { return k < p.key; };
+  auto lo = std::lower_bound(patterns_.begin(), patterns_.end(), key, cmp_key);
+  auto hi = std::upper_bound(lo, patterns_.end(), key, cmp_key_rev);
+  out.reserve(static_cast<size_t>(hi - lo));
+  for (auto it = lo; it != hi; ++it)
+    out.push_back(*it);
+  return out;
+}
+
+std::vector<StarPattern>
+StarDatabase::find_pattern_tolerant(uint64_t key) const {
+  std::vector<StarPattern> out;
+  if (patterns_.empty())
+    return out;
+
+  // Unpack key into 5 × 10-bit components.
+  std::array<int, 5> q = {
+      static_cast<int>((key >> 0) & kQuantMask),
+      static_cast<int>((key >> 10) & kQuantMask),
+      static_cast<int>((key >> 20) & kQuantMask),
+      static_cast<int>((key >> 30) & kQuantMask),
+      static_cast<int>((key >> 40) & kQuantMask),
+  };
+
+  // 3^5 = 243 probes. Skip probes whose perturbed value would underflow
+  // below 0 or overflow above 1023. The exact-key probe (offsets all 0)
+  // is included, so this strictly returns a superset of find_pattern(key).
+  std::array<int, 5> off{};
+  for (off[0] = -1; off[0] <= 1; ++off[0]) {
+    int v0 = q[0] + off[0];
+    if (v0 < 0 || v0 > static_cast<int>(kQuantMax))
+      continue;
+    for (off[1] = -1; off[1] <= 1; ++off[1]) {
+      int v1 = q[1] + off[1];
+      if (v1 < 0 || v1 > static_cast<int>(kQuantMax))
+        continue;
+      for (off[2] = -1; off[2] <= 1; ++off[2]) {
+        int v2 = q[2] + off[2];
+        if (v2 < 0 || v2 > static_cast<int>(kQuantMax))
+          continue;
+        for (off[3] = -1; off[3] <= 1; ++off[3]) {
+          int v3 = q[3] + off[3];
+          if (v3 < 0 || v3 > static_cast<int>(kQuantMax))
+            continue;
+          for (off[4] = -1; off[4] <= 1; ++off[4]) {
+            int v4 = q[4] + off[4];
+            if (v4 < 0 || v4 > static_cast<int>(kQuantMax))
+              continue;
+            uint64_t probe = (static_cast<uint64_t>(v4) << 40) |
+                             (static_cast<uint64_t>(v3) << 30) |
+                             (static_cast<uint64_t>(v2) << 20) |
+                             (static_cast<uint64_t>(v1) << 10) |
+                             (static_cast<uint64_t>(v0));
+            auto cmp_key = [](const StarPattern &p, uint64_t k) {
+              return p.key < k;
+            };
+            auto cmp_key_rev = [](uint64_t k, const StarPattern &p) {
+              return k < p.key;
+            };
+            auto lo = std::lower_bound(patterns_.begin(), patterns_.end(),
+                                       probe, cmp_key);
+            auto hi =
+                std::upper_bound(lo, patterns_.end(), probe, cmp_key_rev);
+            for (auto it = lo; it != hi; ++it)
+              out.push_back(*it);
+          }
+        }
+      }
+    }
+  }
+  return out;
 }

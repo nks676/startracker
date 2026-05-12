@@ -1,10 +1,13 @@
 #include "catalog.h"
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <fstream>
 #include <gtest/gtest.h>
 #include <random>
+#include <set>
 #include <tuple>
 #include <vector>
 
@@ -15,6 +18,7 @@
 
 static const char *STAR_FILE = "../data/catalog_stars.bin";
 static const char *PAIR_FILE = "../data/catalog_pairs.bin";
+static const char *PATTERN_FILE_20 = "../data/catalog_patterns_20.bin";
 
 class CatalogTest : public ::testing::Test {
 protected:
@@ -29,6 +33,92 @@ protected:
 
   std::unique_ptr<StarDatabase> db;
 };
+
+namespace {
+
+// C++ reimplementation of the canonical-order + key helper from
+// tools/generate_catalog.py:canonical_order_and_key. Used by the pattern-hash
+// tests to construct keys from observed unit vectors the same way the
+// generator did from catalog unit vectors. Must stay byte-equivalent to the
+// Python version; see kPatternCanonicalOrderDoc in catalog.h.
+constexpr int kEdgePairs[6][2] = {
+    {0, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}, {2, 3},
+};
+constexpr int kQuantBits = 10;
+constexpr int kQuantScale = (1 << kQuantBits) - 1;
+
+uint64_t pattern_key_from_vectors(const double vecs[4][3], const int ids[4],
+                                  int ordered_ids_out[4]) {
+  // 6 angular distances.
+  double dists[6];
+  for (int e = 0; e < 6; ++e) {
+    int i = kEdgePairs[e][0], j = kEdgePairs[e][1];
+    double d = vecs[i][0] * vecs[j][0] + vecs[i][1] * vecs[j][1] +
+               vecs[i][2] * vecs[j][2];
+    if (d > 1.0)
+      d = 1.0;
+    if (d < -1.0)
+      d = -1.0;
+    dists[e] = std::acos(d);
+  }
+  // Sort edge indices ascending by (distance, pair-lex).
+  std::array<int, 6> edge_order{0, 1, 2, 3, 4, 5};
+  std::sort(edge_order.begin(), edge_order.end(), [&](int a, int b) {
+    if (dists[a] != dists[b])
+      return dists[a] < dists[b];
+    if (kEdgePairs[a][0] != kEdgePairs[b][0])
+      return kEdgePairs[a][0] < kEdgePairs[b][0];
+    return kEdgePairs[a][1] < kEdgePairs[b][1];
+  });
+  // Per-star edge-rank signature.
+  std::array<std::array<int, 3>, 4> sig{};
+  std::array<int, 4> sig_n{0, 0, 0, 0};
+  for (int rank = 0; rank < 6; ++rank) {
+    int e = edge_order[rank];
+    int i = kEdgePairs[e][0], j = kEdgePairs[e][1];
+    sig[i][sig_n[i]++] = rank;
+    sig[j][sig_n[j]++] = rank;
+  }
+  for (int s = 0; s < 4; ++s)
+    std::sort(sig[s].begin(), sig[s].end());
+  // Canonical permutation: sort 4 local indices ascending by (signature, id).
+  std::array<int, 4> canonical{0, 1, 2, 3};
+  std::sort(canonical.begin(), canonical.end(), [&](int a, int b) {
+    for (int k = 0; k < 3; ++k)
+      if (sig[a][k] != sig[b][k])
+        return sig[a][k] < sig[b][k];
+    return ids[a] < ids[b];
+  });
+  // 5 ratios from sorted-distance edges, quantize to 10 bits.
+  double sorted_d[6];
+  for (int k = 0; k < 6; ++k)
+    sorted_d[k] = dists[edge_order[k]];
+  double largest = sorted_d[5];
+  uint64_t q[5];
+  for (int k = 0; k < 5; ++k) {
+    double r = sorted_d[k] / largest;
+    long v = std::lround(r * kQuantScale);
+    if (v < 0)
+      v = 0;
+    if (v > kQuantScale)
+      v = kQuantScale;
+    q[k] = static_cast<uint64_t>(v);
+  }
+  uint64_t key = (q[4] << 40) | (q[3] << 30) | (q[2] << 20) | (q[1] << 10) |
+                 (q[0] << 0);
+  for (int k = 0; k < 4; ++k)
+    ordered_ids_out[k] = ids[canonical[k]];
+  return key;
+}
+
+// Apply a rotation matrix to a 3-vector.
+void rotate3(const double R[3][3], const double v[3], double out[3]) {
+  out[0] = R[0][0] * v[0] + R[0][1] * v[1] + R[0][2] * v[2];
+  out[1] = R[1][0] * v[0] + R[1][1] * v[1] + R[1][2] * v[2];
+  out[2] = R[2][0] * v[0] + R[2][1] * v[1] + R[2][2] * v[2];
+}
+
+} // namespace
 
 TEST_F(CatalogTest, GetStarKnown) {
   // HIP 32349 = Sirius, the brightest star
@@ -252,4 +342,169 @@ TEST_F(CatalogTest, KVectorSmokeTimingNotSlower) {
   // Soft: kvec must not be more than 1.5x slower than binary search.
   EXPECT_LE(dt_kvec, dt_bin * 3 / 2 + 1000);
   (void)sink;
+}
+
+// --- Phase 3e.2: pattern-hash catalog tests ---
+
+// Fixture that additionally loads the 20° pattern catalog. Skipped when the
+// generated binary isn't present (e.g. on a fresh checkout before
+// generate_catalog.py runs).
+class PatternCatalogTest : public CatalogTest {
+protected:
+  void SetUp() override {
+    CatalogTest::SetUp();
+    if (IsSkipped())
+      return;
+    std::ifstream fs(PATTERN_FILE_20, std::ios::binary);
+    if (!fs.good()) {
+      GTEST_SKIP() << "Pattern catalog not found — run generate_catalog.py";
+    }
+    // Read header + a sample of keys directly from the file so individual
+    // tests can probe known-good keys without poking at private members.
+    int32_t hdr[5];
+    fs.read(reinterpret_cast<char *>(hdr), sizeof(hdr));
+    pattern_count_ = hdr[4];
+    // Read all keys (8 bytes each, 870k × 8 = ~7 MB — negligible). Skip the
+    // 16-byte hips field per record.
+    sample_keys_.reserve(static_cast<size_t>(pattern_count_));
+    for (int i = 0; i < pattern_count_; ++i) {
+      uint64_t k;
+      int32_t hips[4];
+      fs.read(reinterpret_cast<char *>(&k), sizeof(k));
+      fs.read(reinterpret_cast<char *>(hips), sizeof(hips));
+      sample_keys_.push_back(k);
+    }
+    fs.close();
+
+    db->load_pattern_catalog(PATTERN_FILE_20);
+  }
+
+  int pattern_count_ = 0;
+  std::vector<uint64_t> sample_keys_;
+};
+
+TEST_F(PatternCatalogTest, PatternCatalogLoads) {
+  EXPECT_TRUE(db->has_pattern_catalog());
+  // 15544 stars × C(8, 3) = 56 patterns ≈ 870k patterns per bin.
+  EXPECT_GT(pattern_count_, 100000)
+      << "Expected > 100k patterns in the 20° bin, got " << pattern_count_;
+  // Exact-key lookup on a real catalog key returns at least one entry.
+  ASSERT_GT(sample_keys_.size(), 0u);
+  auto hits = db->find_pattern(sample_keys_.front());
+  EXPECT_GT(hits.size(), 0u);
+  EXPECT_EQ(hits.front().key, sample_keys_.front());
+}
+
+TEST_F(PatternCatalogTest, PatternKeyOrderingIsConsistent) {
+  // Pick 5 patterns directly from the catalog, project their stars through
+  // a known rotation, recompute the key using the same C++ helper, and
+  // verify find_pattern returns at least one entry whose HIPs are a
+  // permutation of the input. Confirms the rotation-invariance + canonical
+  // ordering convention round-trips.
+  std::vector<StarPattern> sample;
+  std::mt19937_64 rng(0xBADA55ULL);
+  std::uniform_int_distribution<int> pick(0, pattern_count_ - 1);
+  for (int tries = 0; tries < 200 && sample.size() < 5; ++tries) {
+    int idx = pick(rng);
+    auto hits = db->find_pattern(sample_keys_[idx]);
+    for (const auto &p : hits) {
+      try {
+        for (int s = 0; s < 4; ++s)
+          (void)db->get_star(p.hips[s]);
+        sample.push_back(p);
+        if (sample.size() >= 5)
+          break;
+      } catch (...) {
+        // Skip patterns referencing unknown HIPs (shouldn't happen).
+      }
+    }
+  }
+  ASSERT_GE(sample.size(), 5u) << "Could not sample 5 patterns from catalog";
+
+  // A non-trivial rotation: 30° about an arbitrary axis.
+  const double ax = 0.4, ay = 0.6, az = 0.5;
+  const double n = std::sqrt(ax * ax + ay * ay + az * az);
+  const double ux = ax / n, uy = ay / n, uz = az / n;
+  const double theta = 30.0 * M_PI / 180.0;
+  const double c = std::cos(theta), s = std::sin(theta), C = 1.0 - c;
+  const double R[3][3] = {
+      {c + ux * ux * C, ux * uy * C - uz * s, ux * uz * C + uy * s},
+      {uy * ux * C + uz * s, c + uy * uy * C, uy * uz * C - ux * s},
+      {uz * ux * C - uy * s, uz * uy * C + ux * s, c + uz * uz * C},
+  };
+
+  for (const auto &p : sample) {
+    double vecs[4][3];
+    int ids[4];
+    for (int i = 0; i < 4; ++i) {
+      CatalogStar st = db->get_star(p.hips[i]);
+      double v_in[3] = {st.x, st.y, st.z};
+      rotate3(R, v_in, vecs[i]);
+      ids[i] = p.hips[i];
+    }
+    int ordered[4];
+    uint64_t key = pattern_key_from_vectors(vecs, ids, ordered);
+
+    auto hits = db->find_pattern(key);
+    ASSERT_FALSE(hits.empty())
+        << "find_pattern(key) returned no entries for a catalog pattern";
+
+    std::set<int> input_set{p.hips[0], p.hips[1], p.hips[2], p.hips[3]};
+    bool found_perm = false;
+    for (const auto &h : hits) {
+      std::set<int> hit_set{h.hips[0], h.hips[1], h.hips[2], h.hips[3]};
+      if (hit_set == input_set) {
+        found_perm = true;
+        break;
+      }
+    }
+    EXPECT_TRUE(found_perm)
+        << "No catalog entry at key 0x" << std::hex << key << std::dec
+        << " has HIPs matching {" << p.hips[0] << "," << p.hips[1] << ","
+        << p.hips[2] << "," << p.hips[3] << "}";
+  }
+}
+
+TEST_F(PatternCatalogTest, PatternTolerantLookupFindsExactKey) {
+  // For each of 20 random catalog keys, tolerant lookup must return at least
+  // as many results as exact lookup, and every exact result must appear in
+  // the tolerant result.
+  std::mt19937_64 rng(0xC0FFEEULL);
+  std::uniform_int_distribution<int> pick(0, pattern_count_ - 1);
+  for (int trial = 0; trial < 20; ++trial) {
+    uint64_t key = sample_keys_[pick(rng)];
+    auto e = db->find_pattern(key);
+    auto t = db->find_pattern_tolerant(key);
+    ASSERT_FALSE(e.empty());
+    EXPECT_GE(t.size(), e.size());
+    for (const auto &ep : e) {
+      bool present = false;
+      for (const auto &tp : t) {
+        if (tp.key == ep.key && tp.hips[0] == ep.hips[0] &&
+            tp.hips[1] == ep.hips[1] && tp.hips[2] == ep.hips[2] &&
+            tp.hips[3] == ep.hips[3]) {
+          present = true;
+          break;
+        }
+      }
+      EXPECT_TRUE(present) << "exact-lookup hit missing from tolerant lookup";
+    }
+  }
+}
+
+TEST_F(PatternCatalogTest, PatternTolerantLookupCount) {
+  // Sanity bound: tolerant probe should not return more than 300× the exact
+  // count on real catalog keys.
+  std::mt19937_64 rng(0xFADEDULL);
+  std::uniform_int_distribution<int> pick(0, pattern_count_ - 1);
+  for (int trial = 0; trial < 100; ++trial) {
+    uint64_t key = sample_keys_[pick(rng)];
+    auto e = db->find_pattern(key);
+    auto t = db->find_pattern_tolerant(key);
+    ASSERT_FALSE(e.empty());
+    EXPECT_LE(t.size(), e.size() * 300u)
+        << "tolerant probe exploded at key 0x" << std::hex << key
+        << " (exact=" << std::dec << e.size() << ", tolerant=" << t.size()
+        << ")";
+  }
 }
