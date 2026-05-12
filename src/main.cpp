@@ -108,6 +108,27 @@ int main(int argc, char **argv) {
   // 2. Load Catalog
   auto t_catalog_start = clk::now();
   StarDatabase db(star_path, pair_path);
+
+  // Phase 3e: load the pattern-hash catalog for the FOV bin closest to the
+  // camera's FOV. Pattern catalogs are generated for fixed bins of 10°, 15°,
+  // and 20°; we round-robin into the nearest. Missing file → fall through to
+  // pyramid path (load_pattern_catalog throws, which we swallow).
+  {
+    int fov_bin = (fov_deg <= 12.5) ? 10 : (fov_deg <= 17.5) ? 15 : 20;
+    std::string pattern_dir;
+    auto slash = pair_path.find_last_of("/\\");
+    if (slash != std::string::npos) {
+      pattern_dir = pair_path.substr(0, slash + 1);
+    }
+    std::string pattern_path =
+        pattern_dir + "catalog_patterns_" + std::to_string(fov_bin) + ".bin";
+    try {
+      db.load_pattern_catalog(pattern_path);
+    } catch (const std::exception &e) {
+      std::cerr << "Pattern catalog not loaded (" << e.what()
+                << "); identification will use pyramid fallback.\n";
+    }
+  }
   auto t_catalog_end = clk::now();
   if (benchmark) {
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(

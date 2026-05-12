@@ -1,7 +1,11 @@
 #include "identification.h"
+#include <array>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <fstream>
 #include <gtest/gtest.h>
+#include <random>
 #include <set>
 
 // --- 2c. Identification Tests ---
@@ -9,6 +13,7 @@
 
 static const char *STAR_FILE = "../data/catalog_stars.bin";
 static const char *PAIR_FILE = "../data/catalog_pairs.bin";
+static const char *PATTERN_FILE_20 = "../data/catalog_patterns_20.bin";
 
 class IdentificationTest : public ::testing::Test {
 protected:
@@ -400,4 +405,237 @@ TEST_F(IdentificationTest, FalseStarExcluded) {
     EXPECT_NE(s.image_idx, bogus_idx)
         << "Bogus centroid should not have been identified";
   }
+}
+
+// === Phase 3e.3: pattern-hash identification tests ===
+
+// Read the binary catalog at `path` and pull out the pattern record at
+// `target_index`. Used by PatternKeyFromObservedReproducesCatalog to anchor
+// the test against a known-good (key, hips) tuple without re-running the
+// generator. Header layout matches generate_pattern_catalog().
+static bool read_pattern_at_index(const std::string &path, int target_index,
+                                  uint64_t &out_key,
+                                  std::array<int, 4> &out_hips) {
+  std::ifstream fs(path, std::ios::binary);
+  if (!fs) return false;
+  int32_t magic = 0, fov_bin = 0, k_nearest = 0, quant_bits = 0,
+          num_patterns = 0;
+  fs.read(reinterpret_cast<char *>(&magic), 4);
+  fs.read(reinterpret_cast<char *>(&fov_bin), 4);
+  fs.read(reinterpret_cast<char *>(&k_nearest), 4);
+  fs.read(reinterpret_cast<char *>(&quant_bits), 4);
+  fs.read(reinterpret_cast<char *>(&num_patterns), 4);
+  if (!fs || magic != 0x50415431) return false;
+  if (target_index < 0 || target_index >= num_patterns) return false;
+  // Record stride = 8 (key) + 4*4 (hips) = 24 bytes.
+  fs.seekg(static_cast<std::streamoff>(target_index) * 24, std::ios::cur);
+  fs.read(reinterpret_cast<char *>(&out_key), 8);
+  int32_t hips[4] = {0, 0, 0, 0};
+  fs.read(reinterpret_cast<char *>(hips), 16);
+  if (!fs) return false;
+  for (int i = 0; i < 4; ++i) out_hips[i] = hips[i];
+  return true;
+}
+
+// 3e.3 — load-bearing correctness test. Pick a known catalog 4-tuple, project
+// its 4 HIPs through an arbitrary inertial→camera rotation, then run the C++
+// canonical_order key on the resulting unit vectors. The returned uint64 key
+// must match the catalog entry bit-for-bit. If this fails, the pattern path
+// will never match anything.
+//
+// Wave 1 reported index 435,036 has key=0x365a5261894e7 and
+// HIPs=[57211, 57175, 56561, 57669].
+TEST_F(IdentificationTest, PatternKeyFromObservedReproducesCatalog) {
+  std::ifstream fs(PATTERN_FILE_20);
+  if (!fs.good()) {
+    GTEST_SKIP() << "Pattern catalog not present — run generate_catalog.py";
+  }
+
+  uint64_t expected_key = 0;
+  std::array<int, 4> hips{};
+  ASSERT_TRUE(read_pattern_at_index(PATTERN_FILE_20, 435036, expected_key, hips))
+      << "Could not read pattern at index 435036";
+  EXPECT_EQ(expected_key, 0x365a5261894e7ULL);
+  EXPECT_EQ(hips[0], 57211);
+  EXPECT_EQ(hips[1], 57175);
+  EXPECT_EQ(hips[2], 56561);
+  EXPECT_EQ(hips[3], 57669);
+
+  // Inertial unit vectors for the 4 catalog stars.
+  std::array<std::array<double, 3>, 4> v_inertial{};
+  for (int i = 0; i < 4; ++i) {
+    CatalogStar s = db->get_star(hips[i]);
+    v_inertial[i] = {s.x, s.y, s.z};
+  }
+
+  // Arbitrary rotation: 17° about (1, 2, 3)/√14.
+  const double angle = 17.0 * M_PI / 180.0;
+  const double ax = 1.0 / std::sqrt(14.0);
+  const double ay = 2.0 / std::sqrt(14.0);
+  const double az = 3.0 / std::sqrt(14.0);
+  const double c = std::cos(angle);
+  const double s = std::sin(angle);
+  // Rodrigues' formula.
+  double R[3][3] = {
+      {c + ax * ax * (1 - c), ax * ay * (1 - c) - az * s,
+       ax * az * (1 - c) + ay * s},
+      {ay * ax * (1 - c) + az * s, c + ay * ay * (1 - c),
+       ay * az * (1 - c) - ax * s},
+      {az * ax * (1 - c) - ay * s, az * ay * (1 - c) + ax * s,
+       c + az * az * (1 - c)},
+  };
+
+  // Apply R to each inertial vector to get a camera-frame unit vector.
+  std::array<std::array<double, 3>, 4> v_cam{};
+  for (int i = 0; i < 4; ++i) {
+    v_cam[i] = {R[0][0] * v_inertial[i][0] + R[0][1] * v_inertial[i][1] +
+                    R[0][2] * v_inertial[i][2],
+                R[1][0] * v_inertial[i][0] + R[1][1] * v_inertial[i][1] +
+                    R[1][2] * v_inertial[i][2],
+                R[2][0] * v_inertial[i][0] + R[2][1] * v_inertial[i][1] +
+                    R[2][2] * v_inertial[i][2]};
+  }
+
+  // Feed in input-local IDs in some arbitrary order — the canonical-order
+  // algorithm is geometry-determined, so the resulting key must be
+  // independent of input id (except for lex tie-breaks on bit-equal
+  // distances, which don't occur here).
+  std::array<int, 4> ids = {100, 200, 300, 400};
+  std::array<int, 4> canonical_local{};
+  uint64_t key = pattern_key_canonical(v_cam, ids, canonical_local);
+  EXPECT_EQ(key, expected_key)
+      << "C++ canonical_order_and_key disagrees with Python generator";
+
+  // Bonus: shuffle the inputs and re-derive — same key, different canonical
+  // permutation but pointing at the same set.
+  std::array<std::array<double, 3>, 4> v_cam_shuf = {v_cam[2], v_cam[0],
+                                                      v_cam[3], v_cam[1]};
+  std::array<int, 4> ids_shuf = {300, 100, 400, 200};
+  std::array<int, 4> can_shuf{};
+  uint64_t key_shuf = pattern_key_canonical(v_cam_shuf, ids_shuf, can_shuf);
+  EXPECT_EQ(key_shuf, expected_key)
+      << "Pattern key should be invariant to input permutation";
+}
+
+// 3e.3 — pattern path end-to-end on a synthetic scene. Construct a small
+// scene of catalog stars projected through a known rotation, load the
+// pattern catalog, run identify_stars, and assert the HIPs come out right.
+TEST_F(IdentificationTest, PatternPathIdentifiesSyntheticScene) {
+  // Load the FOV-20° pattern catalog. Skip if missing.
+  try {
+    db->load_pattern_catalog(PATTERN_FILE_20);
+  } catch (const std::exception &e) {
+    GTEST_SKIP() << "Pattern catalog not available: " << e.what();
+  }
+  ASSERT_TRUE(db->has_pattern_catalog());
+
+  // 1024x1024, 20° FOV camera.
+  PinholeCamera cam;
+  cam.frame_width = 1024;
+  cam.frame_height = 1024;
+  cam.center_x = 512.0;
+  cam.center_y = 512.0;
+  cam.focal_x = 1024.0 / (2.0 * std::tan(20.0 * M_PI / 360.0));
+  cam.focal_y = cam.focal_x;
+
+  // Boresight on Polaris (HIP 11767, near +Z but offset enough to expose
+  // pyramid-vs-pattern path differences). Use HIP 32349 (Sirius) at Dec ≈
+  // -16°, RA ≈ 6h45m. To get a dense field we point at a busy region: pick
+  // a star and use it as boresight.
+  CatalogStar bs = db->get_star(11767); // Polaris
+  double c3[3] = {bs.x, bs.y, bs.z};
+  double up[3] = {0.0, 0.0, 1.0};
+  if (std::abs(c3[0]) < 1e-6 && std::abs(c3[1]) < 1e-6) {
+    up[0] = 1.0;
+    up[1] = 0.0;
+    up[2] = 0.0;
+  }
+  double c1[3] = {up[1] * c3[2] - up[2] * c3[1],
+                  up[2] * c3[0] - up[0] * c3[2],
+                  up[0] * c3[1] - up[1] * c3[0]};
+  double n1 = std::sqrt(c1[0] * c1[0] + c1[1] * c1[1] + c1[2] * c1[2]);
+  for (int k = 0; k < 3; ++k) c1[k] /= n1;
+  double c2[3] = {c3[1] * c1[2] - c3[2] * c1[1],
+                  c3[2] * c1[0] - c3[0] * c1[2],
+                  c3[0] * c1[1] - c3[1] * c1[0]};
+  double R[3][3] = {{c1[0], c1[1], c1[2]},
+                    {c2[0], c2[1], c2[2]},
+                    {c3[0], c3[1], c3[2]}};
+
+  // Stars within ~5° of Polaris (HIP 11767). Precomputed from the catalog
+  // so the test doesn't have to scan it at runtime.
+  std::vector<int> candidates = {
+      11767, 7283,   84535, 5928,   115746, 19454, 118285,
+      37391, 59767,  5372,  32948,  115550, 71725, 109694,
+      10800, 25911,  85699, 109693, 89465,  21386,
+  };
+  std::vector<StarCentroid> centroids;
+  std::vector<int> expected_hips;
+  for (int hip : candidates) {
+    CatalogStar s;
+    try { s = db->get_star(hip); } catch (...) { continue; }
+    double vz = R[2][0] * s.x + R[2][1] * s.y + R[2][2] * s.z;
+    if (vz <= 0.5) continue; // require z > 0.5 (FOV margin)
+    double vx = R[0][0] * s.x + R[0][1] * s.y + R[0][2] * s.z;
+    double vy = R[1][0] * s.x + R[1][1] * s.y + R[1][2] * s.z;
+    StarCentroid c;
+    c.x = cam.focal_x * (vx / vz) + cam.center_x;
+    c.y = cam.focal_y * (vy / vz) + cam.center_y;
+    c.intensity = 1000.0;
+    c.peak = 250.0 - centroids.size(); // descending peak; first = brightest
+    if (c.x >= 0 && c.x < cam.frame_width && c.y >= 0 &&
+        c.y < cam.frame_height) {
+      centroids.push_back(c);
+      expected_hips.push_back(hip);
+    }
+  }
+  ASSERT_GE(centroids.size(), 6u)
+      << "Need ≥6 stars in FOV for the pattern path";
+
+  auto identified = identify_stars(centroids, cam, *db, 1e-5);
+
+  // The pattern path returns 4 + 1 verified + possibly more from expansion.
+  ASSERT_GE(identified.size(), 4u);
+  std::set<int> expected(expected_hips.begin(), expected_hips.end());
+  for (const auto &s : identified) {
+    EXPECT_TRUE(expected.count(s.catalog_hip_id))
+        << "Pattern path produced an unexpected HIP " << s.catalog_hip_id;
+  }
+}
+
+// 3e.3 — fallback path: an instance of StarDatabase that has NOT had a
+// pattern catalog loaded must still produce correct results via the pyramid.
+// Smoke-tests that the pattern path doesn't short-circuit on `false` from
+// has_pattern_catalog().
+TEST_F(IdentificationTest, PatternPathFallsBackOnMissingCatalog) {
+  // Fresh DB with no pattern catalog loaded.
+  StarDatabase fresh(STAR_FILE, PAIR_FILE);
+  ASSERT_FALSE(fresh.has_pattern_catalog());
+
+  PinholeCamera cam;
+  cam.frame_width = 1024;
+  cam.frame_height = 1024;
+  cam.center_x = 512.0;
+  cam.center_y = 512.0;
+  cam.focal_x = 1024.0 / (2.0 * std::tan(90.0 * M_PI / 180.0 / 2.0));
+  cam.focal_y = cam.focal_x;
+  double R[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+
+  std::vector<int> candidates = {
+      11767, 82396, 75097, 72607, 54061, 53910,
+      58001, 59774, 62956, 65378, 67301,
+  };
+  std::vector<StarCentroid> centroids;
+  std::vector<int> expected_hips;
+  gather_visible_stars(candidates, fresh, cam, R, centroids, expected_hips);
+  ASSERT_GE(centroids.size(), 6u);
+
+  auto identified = identify_stars(centroids, cam, fresh, 1e-5);
+  // Pyramid path on this dense Ursa Major scene must still work.
+  EXPECT_GE(identified.size(), 6u);
+  std::set<int> truth(expected_hips.begin(), expected_hips.end());
+  int correct = 0;
+  for (const auto &s : identified)
+    if (truth.count(s.catalog_hip_id)) ++correct;
+  EXPECT_GE(correct, 6) << "Pyramid fallback should identify the bright stars";
 }

@@ -1,6 +1,8 @@
 #pragma once
 #include "catalog.h"
 #include "image_processing.h"
+#include <array>
+#include <cstdint>
 #include <vector>
 
 // Brown-Conrady camera model. Defaults for k1..p2 give pure pinhole behavior,
@@ -48,3 +50,22 @@ std::vector<IdentifiedStar>
 identify_stars(const std::vector<StarCentroid> &image_stars,
                const PinholeCamera &camera, const StarDatabase &db,
                double cos_tolerance);
+
+// --- Phase 3e.3: pattern-key helper exposed for tests ---
+//
+// Computes the canonical-order 64-bit quantized geometric key for a 4-star
+// pattern, mirroring tools/generate_catalog.py:canonical_order_and_key.
+// `ids4` are the input identifiers (HIPs at catalog gen, centroid indices
+// at runtime); they participate only in the lex tie-break, so the resulting
+// canonical permutation is geometry-determined modulo ties.
+//
+// `out_canonical` (4 entries) receives the local indices [0..3] permuted into
+// canonical order, so the caller can pair observed[ out_canonical[i] ] with
+// hips[i] from a StarPattern record.
+//
+// Exposed in the header (not just as a static helper in identification.cpp)
+// so test_identification.cpp can round-trip the C++ key against the binary
+// catalog without rebuilding the algorithm in the test file.
+uint64_t pattern_key_canonical(const std::array<std::array<double, 3>, 4> &vecs4,
+                               const std::array<int, 4> &ids4,
+                               std::array<int, 4> &out_canonical);
