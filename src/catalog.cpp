@@ -1,16 +1,132 @@
 #include "catalog.h"
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <fcntl.h>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+// --- Phase 3f.4: mmap-based catalog load ---
+//
+// We mmap the pair, k-vector, and pattern files PROT_READ MAP_PRIVATE,
+// madvise(MADV_RANDOM) (all three are random-access binary-search targets),
+// and mlock (best-effort) to pin them in physical memory so the first solve
+// has the same latency as steady-state. mlock implicitly prefaults; on the
+// mlock-failed fallback path we walk every page explicitly so the first
+// solve doesn't pay a major-fault avalanche on the cold cache.
+//
+// The on-disk struct layouts must match the in-memory layouts byte-for-byte.
+// Both target architectures (x86-64, arm64) are little-endian; the relevant
+// types (double, int32, int64) have well-known sizes. These static_asserts
+// fail the build loudly if anyone reorders fields or adds padding.
+static_assert(sizeof(CatalogPair) == 16,
+              "CatalogPair must be exactly 16 bytes (double + 2*int32) to "
+              "match the on-disk layout written by tools/generate_catalog.py");
+static_assert(sizeof(StarPattern) == 24,
+              "StarPattern must be exactly 24 bytes (uint64 + 4*int32) to "
+              "match the on-disk layout written by tools/generate_catalog.py");
+static_assert(sizeof(int32_t) == sizeof(int),
+              "This file assumes int is 32-bit. The on-disk layouts and the "
+              "ifstream/mmap loaders both write/read raw int into 4-byte "
+              "fields; a 16-bit or 64-bit int target would corrupt them.");
+
+namespace {
+constexpr size_t kPageSize = 4096; // assumed page granularity for prefault
+
+// Touch every page of [ptr, ptr+size) so the kernel populates the page
+// table eagerly. Without this, the first access pays a major page fault.
+// Reading into a volatile sink prevents the optimizer from eliding the load.
+void prefault(const uint8_t *ptr, size_t size) {
+  volatile uint8_t sink = 0;
+  for (size_t i = 0; i < size; i += kPageSize)
+    sink = static_cast<uint8_t>(sink ^ ptr[i]);
+  (void)sink;
+}
+} // namespace
+
+std::pair<const uint8_t *, size_t>
+StarDatabase::mmap_file(const std::string &path) {
+  int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd < 0)
+    throw std::runtime_error("Could not open " + path + ": " +
+                             std::strerror(errno));
+  struct stat st {};
+  if (::fstat(fd, &st) != 0) {
+    int err = errno;
+    ::close(fd);
+    throw std::runtime_error("fstat failed on " + path + ": " +
+                             std::strerror(err));
+  }
+  if (st.st_size <= 0) {
+    ::close(fd);
+    throw std::runtime_error("Empty or unreadable file: " + path);
+  }
+  size_t size = static_cast<size_t>(st.st_size);
+  void *ptr = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+  // The fd can be closed immediately after mmap; the mapping holds its own
+  // reference.
+  ::close(fd);
+  if (ptr == MAP_FAILED)
+    throw std::runtime_error("mmap failed on " + path + ": " +
+                             std::strerror(errno));
+  // We binary-search the mapped region, so access is random, not sequential.
+  // Advise the kernel accordingly so it doesn't waste read-ahead bandwidth.
+  if (::madvise(ptr, size, MADV_RANDOM) != 0) {
+    // Non-fatal: just a hint.
+    std::cerr << "[mmap] madvise(MADV_RANDOM) failed on " << path << ": "
+              << std::strerror(errno) << " (continuing)\n";
+  }
+  // Pin in physical memory so the first solve doesn't pay a page-in cost.
+  // mlock may fail on Pi 4 without `ulimit -l unlimited` / a raised
+  // RLIMIT_MEMLOCK; we treat that as a soft warning, not an error. The
+  // mapping is still valid; pages just may be evicted under pressure.
+  //
+  // mlock is documented to populate the resident set ("All pages which
+  // contain a part of the specified address range are guaranteed to be
+  // resident in RAM when the call returns successfully"), so a successful
+  // mlock implicitly prefaults. We still walk the pages on the mlock-failed
+  // path so the first solve doesn't pay a major-fault avalanche on the cold
+  // cache.
+  bool mlocked = (::mlock(ptr, size) == 0);
+  if (!mlocked) {
+    std::cerr << "[mmap] mlock failed on " << path << ": "
+              << std::strerror(errno)
+              << " (RLIMIT_MEMLOCK too low?); continuing without pin\n";
+    prefault(static_cast<const uint8_t *>(ptr), size);
+  }
+  mappings_.push_back({ptr, size});
+  return {static_cast<const uint8_t *>(ptr), size};
+}
+
+StarDatabase::~StarDatabase() {
+  // Tear down in reverse insertion order purely for symmetry; munmap doesn't
+  // care about ordering.
+  for (auto it = mappings_.rbegin(); it != mappings_.rend(); ++it) {
+    if (it->ptr && it->size > 0) {
+      // munlock is best-effort: if we never successfully mlock'd (Pi 4
+      // without RLIMIT_MEMLOCK), this returns EINVAL/EPERM. Either way the
+      // subsequent munmap will release the mapping.
+      (void)::munlock(it->ptr, it->size);
+      (void)::munmap(it->ptr, it->size);
+    }
+  }
+  mappings_.clear();
+}
 
 StarDatabase::StarDatabase(const std::string &star_file,
                            const std::string &pair_file) {
-  // Read stars
+  // --- Stars: still ifstream. Tiny (~435 KB), feeds an unordered_map. ---
+  // mmap would not help here: the destination is a hash table that must be
+  // built in heap memory anyway, so any savings on the read are dwarfed by
+  // the map insertions.
   std::ifstream fs_stars(star_file, std::ios::binary);
   if (!fs_stars)
     throw std::runtime_error("Could not open star file");
@@ -28,27 +144,41 @@ StarDatabase::StarDatabase(const std::string &star_file,
     star_map[id] = {id, x, y, z};
   }
 
-  // Read pairs
-  std::ifstream fs_pairs(pair_file, std::ios::binary);
-  if (!fs_pairs)
-    throw std::runtime_error("Could not open pair file");
-
-  int num_pairs;
-  fs_pairs.read(reinterpret_cast<char *>(&num_pairs), sizeof(int));
-
-  pairs.resize(num_pairs);
-  for (int i = 0; i < num_pairs; ++i) {
-    double cos_val;
-    int id1, id2;
-    fs_pairs.read(reinterpret_cast<char *>(&cos_val), sizeof(double));
-    fs_pairs.read(reinterpret_cast<char *>(&id1), sizeof(int));
-    fs_pairs.read(reinterpret_cast<char *>(&id2), sizeof(int));
-    pairs[i] = {cos_val, id1, id2};
-  }
+  // --- Pairs: mmap. This is the 99 MB file that previously dominated
+  // catalog_load (~360 ms of ifstream read+memcpy on M-series; much worse on
+  // Pi 4 / SD card). ---
+  auto [pair_bytes, pair_size] = mmap_file(pair_file);
+  // Header: int32 num_pairs.
+  if (pair_size < sizeof(int32_t))
+    throw std::runtime_error("Pair file truncated (no header): " + pair_file);
+  int32_t num_pairs = 0;
+  std::memcpy(&num_pairs, pair_bytes, sizeof(int32_t));
+  if (num_pairs < 0)
+    throw std::runtime_error("Pair file claims negative num_pairs");
+  size_t body_size = sizeof(int32_t) + static_cast<size_t>(num_pairs) *
+                                           sizeof(CatalogPair);
+  if (pair_size < body_size)
+    throw std::runtime_error("Pair file truncated (header says " +
+                             std::to_string(num_pairs) +
+                             " pairs, file too short)");
+  // CatalogPair is 16 bytes; the file header is 4 bytes, so the array starts
+  // at byte 4. That's 4-byte aligned but the natural alignment of double is
+  // 8 bytes. In practice both x86-64 and arm64 tolerate unaligned 8-byte
+  // loads, and the generator writes the file with this exact 4-byte offset.
+  // We reinterpret directly — the static_assert above guards struct size,
+  // and on these targets the unaligned-double access is well-defined at the
+  // hardware level (though strictly UB per the C++ standard; if a strict
+  // architecture is added later, switch to memcpy-per-element).
+  pairs_ptr_ =
+      reinterpret_cast<const CatalogPair *>(pair_bytes + sizeof(int32_t));
+  pairs_count_ = static_cast<size_t>(num_pairs);
 
   // Build per-star partner index for pyramid-style identification expansion.
+  // Same logic as before — derived structures still cost RAM + CPU; the mmap
+  // win is purely on the file-read side.
   per_star_partners.reserve(num_stars);
-  for (const auto &p : pairs) {
+  for (size_t i = 0; i < pairs_count_; ++i) {
+    const CatalogPair &p = pairs_ptr_[i];
     per_star_partners[p.id1].emplace_back(p.cos_val, p.id2);
     per_star_partners[p.id2].emplace_back(p.cos_val, p.id1);
   }
@@ -56,7 +186,7 @@ StarDatabase::StarDatabase(const std::string &star_file,
     std::sort(kv.second.begin(), kv.second.end());
   }
 
-  // --- Load Mortari k-vector index (optional) ---
+  // --- Load Mortari k-vector index (optional, via mmap) ---
   // The index file lives alongside the pair file. If it is missing, the
   // database still works; find_pairs_kvec falls back to the binary-search
   // implementation.
@@ -68,21 +198,28 @@ StarDatabase::StarDatabase(const std::string &star_file,
     else
       kvec_file = pair_file.substr(0, slash + 1) + "catalog_kvec.bin";
   }
-  std::ifstream fs_kvec(kvec_file, std::ios::binary);
-  if (fs_kvec) {
-    int M = 0;
-    fs_kvec.read(reinterpret_cast<char *>(&M), sizeof(int));
-    double y_min = 0.0, y_max = 0.0, dq = 0.0;
-    fs_kvec.read(reinterpret_cast<char *>(&y_min), sizeof(double));
-    fs_kvec.read(reinterpret_cast<char *>(&y_max), sizeof(double));
-    fs_kvec.read(reinterpret_cast<char *>(&dq), sizeof(double));
-    if (M > 0 && fs_kvec) {
-      std::vector<int> K(static_cast<size_t>(M) + 1);
-      fs_kvec.read(reinterpret_cast<char *>(K.data()),
-                   static_cast<std::streamsize>((static_cast<size_t>(M) + 1) *
-                                                sizeof(int)));
-      if (fs_kvec) {
-        kvec_K = std::move(K);
+  // Probe for existence before going through mmap_file (which throws on
+  // missing). The optional nature of kvec is preserved.
+  if (::access(kvec_file.c_str(), R_OK) == 0) {
+    auto [kvec_bytes, kvec_size] = mmap_file(kvec_file);
+    // Header layout (must match tools/generate_catalog.py):
+    //   int32 M, double y_min, double y_max, double dq, then (M+1) int32.
+    const size_t hdr_size = sizeof(int32_t) + 3 * sizeof(double);
+    if (kvec_size >= hdr_size) {
+      int32_t M = 0;
+      double y_min = 0, y_max = 0, dq = 0;
+      std::memcpy(&M, kvec_bytes, sizeof(int32_t));
+      std::memcpy(&y_min, kvec_bytes + sizeof(int32_t), sizeof(double));
+      std::memcpy(&y_max, kvec_bytes + sizeof(int32_t) + sizeof(double),
+                  sizeof(double));
+      std::memcpy(&dq, kvec_bytes + sizeof(int32_t) + 2 * sizeof(double),
+                  sizeof(double));
+      const size_t body_bytes =
+          hdr_size + static_cast<size_t>(M + 1) * sizeof(int32_t);
+      if (M > 0 && kvec_size >= body_bytes) {
+        kvec_K_ptr_ =
+            reinterpret_cast<const int32_t *>(kvec_bytes + hdr_size);
+        kvec_K_count_ = static_cast<size_t>(M) + 1;
         kvec_y_min = y_min;
         kvec_y_max = y_max;
         kvec_dq = dq;
@@ -91,7 +228,8 @@ StarDatabase::StarDatabase(const std::string &star_file,
                   << " bins, dq=" << kvec_dq << "\n";
       } else {
         std::cerr << "Warning: k-vector file " << kvec_file
-                  << " truncated; falling back to binary search.\n";
+                  << " truncated or invalid M; falling back to binary "
+                     "search.\n";
       }
     } else {
       std::cerr << "Warning: k-vector file " << kvec_file
@@ -137,10 +275,11 @@ std::vector<CatalogPair> StarDatabase::find_pairs(double cos_target,
     return p.cos_val > val; // descending
   };
 
-  auto it_begin = std::lower_bound(pairs.begin(), pairs.end(),
-                                   cos_target + cos_tolerance, comp);
-  auto it_end = std::lower_bound(pairs.begin(), pairs.end(),
-                                 cos_target - cos_tolerance, comp);
+  const CatalogPair *begin = pairs_ptr_;
+  const CatalogPair *end = pairs_ptr_ + pairs_count_;
+  auto it_begin =
+      std::lower_bound(begin, end, cos_target + cos_tolerance, comp);
+  auto it_end = std::lower_bound(begin, end, cos_target - cos_tolerance, comp);
 
   return std::vector<CatalogPair>(it_begin, it_end);
 }
@@ -149,7 +288,8 @@ std::vector<CatalogPair>
 StarDatabase::find_pairs_kvec(double cos_target,
                               double cos_tolerance) const {
   // Fall back to binary search when the k-vector index is unavailable.
-  if (kvec_K.empty() || kvec_M <= 0 || kvec_dq <= 0.0 || pairs.empty())
+  if (kvec_K_ptr_ == nullptr || kvec_M <= 0 || kvec_dq <= 0.0 ||
+      pairs_count_ == 0)
     return find_pairs(cos_target, cos_tolerance);
 
   const double cos_low = cos_target - cos_tolerance;
@@ -190,11 +330,11 @@ StarDatabase::find_pairs_kvec(double cos_target,
   // one or two entries. We trim with a tiny linear walk so the final return
   // can be a single std::vector range copy (memcpy), matching find_pairs'
   // throughput.
-  int start = kvec_K[i_high];
-  int end = kvec_K[i_low];
+  int start = kvec_K_ptr_[i_high];
+  int end = kvec_K_ptr_[i_low];
   if (start < 0)
     start = 0;
-  const int P = static_cast<int>(pairs.size());
+  const int P = static_cast<int>(pairs_count_);
   if (end >= P)
     end = P - 1;
   if (end < 0 || start > end || start >= P)
@@ -203,17 +343,16 @@ StarDatabase::find_pairs_kvec(double cos_target,
   // Trim the high-cos slack from the front: advance `start` while
   // pairs[start].cos_val > cos_high. Bounded by ceil(dq * (M+1) / dq) = O(1)
   // entries in practice because dq << tolerance.
-  while (start <= end && pairs[start].cos_val > cos_high)
+  while (start <= end && pairs_ptr_[start].cos_val > cos_high)
     ++start;
   // Trim the low-cos slack from the back: retreat `end` while
   // pairs[end].cos_val < cos_low.
-  while (end >= start && pairs[end].cos_val < cos_low)
+  while (end >= start && pairs_ptr_[end].cos_val < cos_low)
     --end;
   if (start > end)
     return {};
 
-  return std::vector<CatalogPair>(pairs.begin() + start,
-                                  pairs.begin() + end + 1);
+  return std::vector<CatalogPair>(pairs_ptr_ + start, pairs_ptr_ + end + 1);
 }
 
 CatalogStar StarDatabase::get_star(int hip_id) const {
@@ -235,23 +374,23 @@ constexpr uint64_t kQuantMax = kQuantMask; // 1023
 } // namespace
 
 void StarDatabase::load_pattern_catalog(const std::string &pattern_file) {
-  std::ifstream fs(pattern_file, std::ios::binary);
-  if (!fs)
-    throw std::runtime_error("Could not open pattern catalog: " + pattern_file);
+  // mmap-based load (Phase 3f.4). 21 MB file; previous ifstream read took
+  // tens of ms on cold cache. Header is 5 × int32 (20 bytes), then a
+  // densely-packed array of StarPattern (24 bytes each).
+  auto [bytes, size] = mmap_file(pattern_file);
+  const size_t hdr_size = 5 * sizeof(int32_t);
+  if (size < hdr_size)
+    throw std::runtime_error(
+        "Pattern catalog truncated (no header): " + pattern_file);
 
-  int32_t magic = 0;
-  int32_t fov_bin_deg = 0;
-  int32_t k_nearest = 0;
-  int32_t quant_bits = 0;
-  int32_t num_patterns = 0;
-  fs.read(reinterpret_cast<char *>(&magic), sizeof(int32_t));
-  fs.read(reinterpret_cast<char *>(&fov_bin_deg), sizeof(int32_t));
-  fs.read(reinterpret_cast<char *>(&k_nearest), sizeof(int32_t));
-  fs.read(reinterpret_cast<char *>(&quant_bits), sizeof(int32_t));
-  fs.read(reinterpret_cast<char *>(&num_patterns), sizeof(int32_t));
-  if (!fs)
-    throw std::runtime_error("Pattern catalog header read failed: " +
-                             pattern_file);
+  int32_t magic = 0, fov_bin_deg = 0, k_nearest = 0, quant_bits = 0,
+          num_patterns = 0;
+  std::memcpy(&magic, bytes + 0 * sizeof(int32_t), sizeof(int32_t));
+  std::memcpy(&fov_bin_deg, bytes + 1 * sizeof(int32_t), sizeof(int32_t));
+  std::memcpy(&k_nearest, bytes + 2 * sizeof(int32_t), sizeof(int32_t));
+  std::memcpy(&quant_bits, bytes + 3 * sizeof(int32_t), sizeof(int32_t));
+  std::memcpy(&num_patterns, bytes + 4 * sizeof(int32_t), sizeof(int32_t));
+
   if (magic != kPatternMagic)
     throw std::runtime_error("Pattern catalog bad magic: " + pattern_file);
   if (quant_bits != kQuantBits)
@@ -261,27 +400,28 @@ void StarDatabase::load_pattern_catalog(const std::string &pattern_file) {
   if (num_patterns < 0)
     throw std::runtime_error("Pattern catalog negative num_patterns");
 
+  const size_t body_bytes =
+      hdr_size + static_cast<size_t>(num_patterns) * sizeof(StarPattern);
+  if (size < body_bytes)
+    throw std::runtime_error("Pattern catalog truncated (header says " +
+                             std::to_string(num_patterns) +
+                             " patterns, file too short): " + pattern_file);
+
   pattern_fov_bin_deg_ = fov_bin_deg;
   pattern_k_nearest_ = k_nearest;
   pattern_quant_bits_ = quant_bits;
 
-  patterns_.clear();
-  patterns_.resize(static_cast<size_t>(num_patterns));
-  for (int i = 0; i < num_patterns; ++i) {
-    StarPattern p;
-    fs.read(reinterpret_cast<char *>(&p.key), sizeof(uint64_t));
-    fs.read(reinterpret_cast<char *>(&p.hips[0]), sizeof(int32_t) * 4);
-    if (!fs)
-      throw std::runtime_error(
-          "Pattern catalog body short at index " + std::to_string(i) + " of " +
-          std::to_string(num_patterns));
-    patterns_[i] = p;
-  }
+  // 20-byte header, 24-byte StarPattern → array starts at byte 20 which is
+  // 4-byte aligned but not 8-byte aligned. uint64_t loads on the targets we
+  // support (x86-64, arm64) tolerate this; if a strict-alignment target is
+  // added, replace with memcpy-per-record.
+  patterns_ptr_ = reinterpret_cast<const StarPattern *>(bytes + hdr_size);
+  patterns_count_ = static_cast<size_t>(num_patterns);
 
   // Generator already sorts ascending by key, but verify cheaply to fail
   // loudly on a corrupted/mis-ordered file rather than silently returning
   // wrong results from std::lower_bound.
-  if (!std::is_sorted(patterns_.begin(), patterns_.end(),
+  if (!std::is_sorted(patterns_ptr_, patterns_ptr_ + patterns_count_,
                       [](const StarPattern &a, const StarPattern &b) {
                         return a.key < b.key;
                       })) {
@@ -296,15 +436,17 @@ void StarDatabase::load_pattern_catalog(const std::string &pattern_file) {
 
 std::vector<StarPattern> StarDatabase::find_pattern(uint64_t key) const {
   std::vector<StarPattern> out;
-  if (patterns_.empty())
+  if (patterns_count_ == 0)
     return out;
 
   // The vector is sorted ascending by key. equal_range gives the half-open
   // [lo, hi) range whose keys equal `key`.
   auto cmp_key = [](const StarPattern &p, uint64_t k) { return p.key < k; };
   auto cmp_key_rev = [](uint64_t k, const StarPattern &p) { return k < p.key; };
-  auto lo = std::lower_bound(patterns_.begin(), patterns_.end(), key, cmp_key);
-  auto hi = std::upper_bound(lo, patterns_.end(), key, cmp_key_rev);
+  const StarPattern *begin = patterns_ptr_;
+  const StarPattern *end = patterns_ptr_ + patterns_count_;
+  auto lo = std::lower_bound(begin, end, key, cmp_key);
+  auto hi = std::upper_bound(lo, end, key, cmp_key_rev);
   out.reserve(static_cast<size_t>(hi - lo));
   for (auto it = lo; it != hi; ++it)
     out.push_back(*it);
@@ -314,7 +456,7 @@ std::vector<StarPattern> StarDatabase::find_pattern(uint64_t key) const {
 std::vector<StarPattern>
 StarDatabase::find_pattern_tolerant(uint64_t key) const {
   std::vector<StarPattern> out;
-  if (patterns_.empty())
+  if (patterns_count_ == 0)
     return out;
 
   // Unpack key into 5 × 10-bit components.
@@ -325,6 +467,9 @@ StarDatabase::find_pattern_tolerant(uint64_t key) const {
       static_cast<int>((key >> 30) & kQuantMask),
       static_cast<int>((key >> 40) & kQuantMask),
   };
+
+  const StarPattern *begin = patterns_ptr_;
+  const StarPattern *end = patterns_ptr_ + patterns_count_;
 
   // 3^5 = 243 probes. Skip probes whose perturbed value would underflow
   // below 0 or overflow above 1023. The exact-key probe (offsets all 0)
@@ -361,10 +506,8 @@ StarDatabase::find_pattern_tolerant(uint64_t key) const {
             auto cmp_key_rev = [](uint64_t k, const StarPattern &p) {
               return k < p.key;
             };
-            auto lo = std::lower_bound(patterns_.begin(), patterns_.end(),
-                                       probe, cmp_key);
-            auto hi =
-                std::upper_bound(lo, patterns_.end(), probe, cmp_key_rev);
+            auto lo = std::lower_bound(begin, end, probe, cmp_key);
+            auto hi = std::upper_bound(lo, end, probe, cmp_key_rev);
             for (auto it = lo; it != hi; ++it)
               out.push_back(*it);
           }

@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -57,6 +58,13 @@ constexpr const char *kPatternCanonicalOrderDoc =
 class StarDatabase {
 public:
   StarDatabase(const std::string &star_file, const std::string &pair_file);
+  ~StarDatabase();
+
+  // Non-copyable / non-movable: holds raw mmap regions.
+  StarDatabase(const StarDatabase &) = delete;
+  StarDatabase &operator=(const StarDatabase &) = delete;
+  StarDatabase(StarDatabase &&) = delete;
+  StarDatabase &operator=(StarDatabase &&) = delete;
 
   // Find all catalog pairs within a tolerance around a cosine distance
   // (binary-search implementation, kept for parity tests).
@@ -101,29 +109,58 @@ public:
 
   // True iff load_pattern_catalog() has been called successfully and the
   // loaded catalog contains at least one pattern.
-  bool has_pattern_catalog() const { return !patterns_.empty(); }
+  bool has_pattern_catalog() const { return patterns_count_ > 0; }
 
 private:
+  // --- mmap bookkeeping (Phase 3f.4) ---
+  // A region of file bytes mapped into our address space. The destructor
+  // munlocks (best-effort) and munmaps each region. Ordering of mappings_
+  // doesn't matter; we just iterate at teardown.
+  struct MmapRegion {
+    void *ptr = nullptr;
+    size_t size = 0;
+  };
+  std::vector<MmapRegion> mappings_;
+
+  // mmap helper: opens `path`, mmaps the whole file PROT_READ MAP_PRIVATE,
+  // madvise(RANDOM), best-effort mlock, prefaults every page, registers the
+  // mapping in `mappings_`, and returns (ptr, size). Throws on open/stat/mmap
+  // failure (those are fatal); mlock failure is logged and ignored.
+  std::pair<const uint8_t *, size_t> mmap_file(const std::string &path);
+
+  // star_map remains heap-allocated: file is small (435 KB), and the hash
+  // table itself can't live in a mmap'd file.
   std::unordered_map<int, CatalogStar> star_map;
-  std::vector<CatalogPair> pairs; // Sorted descending by cos_val
+
+  // pairs is the mmap'd CatalogPair array (sorted descending by cos_val).
+  // Non-owning: lifetime is tied to the corresponding MmapRegion. The header
+  // is `int32 num_pairs` at the start of the file, so pairs_ptr_ points at
+  // ptr + 4 in the pair-file mapping.
+  const CatalogPair *pairs_ptr_ = nullptr;
+  size_t pairs_count_ = 0;
 
   // Per-star index: hip -> sorted (cos_distance, partner_hip) entries.
-  // Built once in the constructor from `pairs`. Memory: 2 * |pairs| entries.
+  // Built once in the constructor from the mapped pair array. Memory: 2 *
+  // |pairs| entries. Note that this index dwarfs the pair file itself in
+  // RAM (~250 MB vs 99 MB), so Phase 3f.4's mmap win is on the *file read*,
+  // not on overall RSS.
   std::unordered_map<int, std::vector<std::pair<double, int>>>
       per_star_partners;
 
-  // Mortari k-vector index over `pairs`. `kvec_K[i]` is the largest index j in
-  // the descending pairs array such that pairs[j].cos_val >= y_min + i * dq.
-  // Empty if the index file was not present (find_pairs_kvec then falls back).
-  std::vector<int> kvec_K;
+  // Mortari k-vector index. `kvec_K_ptr_[i]` is the largest index j in the
+  // descending pairs array such that pairs[j].cos_val >= y_min + i * dq.
+  // Null if the index file was not present (find_pairs_kvec then falls back).
+  const int32_t *kvec_K_ptr_ = nullptr;
+  size_t kvec_K_count_ = 0; // == kvec_M + 1 when loaded
   double kvec_y_min = 0.0;
   double kvec_y_max = 0.0;
   double kvec_dq = 0.0;
   int kvec_M = 0;
 
   // Pattern catalog (Phase 3e.2). Sorted ascending by key for
-  // std::lower_bound lookup. Empty until load_pattern_catalog() is called.
-  std::vector<StarPattern> patterns_;
+  // std::lower_bound lookup. Null until load_pattern_catalog() is called.
+  const StarPattern *patterns_ptr_ = nullptr;
+  size_t patterns_count_ = 0;
   int pattern_fov_bin_deg_ = 0;
   int pattern_k_nearest_ = 0;
   int pattern_quant_bits_ = 0;
