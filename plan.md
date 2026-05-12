@@ -484,7 +484,194 @@ Replace binary search in `find_pairs()` with Mortari's k-vector for O(1) lookup.
       alt40 identify=5.4s, alt60 identify=18.6s (median). Identify-stage
       cost grew vs. W5's pre-merge baseline because CAP rose 25→50 and
       W3's coarse-refine wrapper runs an extra pass on miscalibrated
-      cameras. RANSAC seeding (3b.0a option b) would cut this — deferred.
+      cameras. **The 3c "speed optimization" goal of <1s on Pi 4 was not
+      met by k-vector alone — it's an algorithm-class problem, not a
+      tuning problem. See Phase 3e.**
+
+---
+
+### Speed Reality Check + Sequencing Decision (post-3c)
+
+After Phase 3b/3c shipped, alt60 cold-start is **~19s on M-series desktop**.
+That's unusable for any practical iteration loop, let alone the <1s Pi 4 goal.
+Root cause is structural: pairwise pyramid identification is **O(N²) seed
+pairs × O(log P) catalog lookups × O(N) expansion**, and k-vector replaced
+only the log-P lookup with a constant factor — it didn't change the
+exponent. Tetra3 (the open-source plate solver that PiFinder uses) takes
+**50–300ms on a Pi 4** because it uses a fundamentally different algorithm:
+hash-based pattern lookup, not pairwise voting. Closing the gap requires
+adopting that algorithm class.
+
+**Sequencing decision (2026-05-11):** Phase **3e (pattern hashing) goes
+before** Pi-hardware integration. Phase **3f (SIMD + cache + mmap) goes
+after**. Reasons:
+
+- 19s solve time makes Pi iteration unproductive — every test cycle is dead
+  time. tetra3-class ~100ms is the floor where the Pi becomes usable.
+- 3e rewrites the catalog binary format. If Pi tooling (capture, calibration,
+  deployment) is built against the current cosine-pair format, then 3e
+  replaces it, you redo that integration work twice.
+- 3f is architecture-specific. NEON ≠ AVX2, Pi cache hierarchy ≠ M-series,
+  and the real bottleneck on Pi (thermal, USB camera bandwidth, mmap fault
+  latency on SD) may not be what desktop benchmarks predict. Measure first.
+
+**Sequence:** 3e → Pi integration (+ deferred 3a.6) → 3f → 3d.
+Phase 3d (EKF tracking) needs frame sequences which only the Pi will
+provide naturally; it moves to after Pi too.
+
+---
+
+### Phase 3e — Pattern-Hash Identification
+
+**Goal:** Replace pairwise pyramid voting with tetra3-style 4-star pattern
+hashing. Target post-3e: **5–20ms on desktop, 50–200ms on Pi 4.**
+
+This is the load-bearing speed change; without it, Phase 3f's
+micro-optimizations are wasted on the wrong algorithm.
+
+**Algorithm overview:**
+
+For each star S in the catalog, find its 3 nearest neighbors A, B, C within
+FOV/2. Compute the 6 pairwise angular distances among {S, A, B, C}. Sort
+the 6 distances ascending; normalize all six by the largest (yielding 5
+ratios in [0, 1]); quantize each ratio to ~10 bits; pack the 5 quantized
+values into a single 64-bit hash key. Insert (key → 4-tuple of HIPs) into a
+hash table. At query time: pick the brightest centroid, repeat the same
+computation, single hash lookup, verify the candidate 4-tuple against one
+or two additional observed stars, return on first acceptance.
+
+#### 3e.1: Pattern catalog generation
+
+- **Modify:** `tools/generate_catalog.py` — emit a new binary
+  `data/catalog_patterns.bin` (per FOV bin) replacing/supplementing
+  `catalog_pairs.bin`. Format: `[int32 num_buckets, int32 fov_bin_deg,
+  int32 num_patterns, num_patterns × (uint64 key, int32[4] hips)]`. Bucket
+  count chosen so load factor ~0.5.
+- **Multi-FOV bins:** Generate one catalog at each of {5°, 10°, 15°, 20°}.
+  At runtime, pick the bin closest to the camera's FOV.
+- **Catalog size estimate:** N=15544 stars × C(8 nearest, 3) ≈ 870k patterns
+  per FOV. ~30 MB per bin on disk; ~100 MB total across 4 bins. Acceptable.
+
+#### 3e.2: C++ hash table loader + query
+
+- **Rewrite:** `src/catalog.{h,cpp}` — replace `find_pairs`/`find_pairs_kvec`
+  with `find_pattern(uint64 key) → vector<array<int, 4>>`. Use open-
+  addressing Robin Hood hash for cache-friendly probes (1 cache miss per
+  lookup in the common case).
+- **Keep:** `get_star(hip)` and the star-position table as-is; pattern hash
+  only changes the *search* index, not the underlying star data.
+
+#### 3e.3: Replace identify_stars with pattern lookup
+
+- **Rewrite:** `src/identification.{h,cpp}` — replace the pyramid loop with:
+  1. Take the brightest 6–8 centroids (peak-ranked).
+  2. For the brightest, compute its pattern key using its 3 nearest
+     neighbors among the chosen centroids.
+  3. Lookup → list of candidate 4-tuples. For each: solve attitude on the
+     4 stars (TRIAD), project a 5th observed star, accept if it lands
+     within 0.05° of its predicted position.
+  4. First acceptance wins → QUEST refines on all 4–6 inliers.
+- **Multi-key probing:** Quantization can drop a ratio across a bucket
+  boundary. Probe the key and its 5 ±1-in-one-dim neighbors. (32 keys
+  in worst case if we go ±1 in all dims; usually 1 hit suffices.)
+- **Fallback:** if no pattern matches after trying patterns from the top 4
+  brightest centroids, fall back to the existing pyramid path (slow but
+  thorough). Keeps current pyramid code in place as a safety net.
+
+#### 3e.4: Tests + benchmark gate
+
+- **Tests:** `tests/test_pattern_hash.cpp` — pattern roundtrip
+  (catalog → pattern → catalog), real-image regression unchanged, Monte
+  Carlo 100 trials.
+- **Benchmark gate:** `tools/benchmark.py` must show alt40 + alt60 total
+  < 100ms on desktop. (Pi target unverifiable until hardware exists; treat
+  100ms desktop as proxy.)
+- **Resume value:** "Implemented tetra3-style 4-star pattern hashing in
+  C++; achieved <X ms on commodity hardware."
+
+#### Phase 3e Checklist
+
+- [ ] 3e.1: Pattern catalog generation (multi-FOV bins)
+- [ ] 3e.2: Hash table loader + query in C++
+- [ ] 3e.3: identify_stars rewrite (pattern lookup + verify, pyramid fallback)
+- [ ] 3e.4: Tests + benchmark gate (<100ms desktop on both real fixtures)
+- [ ] Monte Carlo ≥ 95%, per-trial threshold tightened to 0.1°
+
+---
+
+### Pi 4 Hardware Integration (between 3e and 3f)
+
+After 3e lands and identification is fast enough to be usable, the project
+moves onto the target hardware: Raspberry Pi 4 + HQ Camera + CS-mount
+lens (the PiFinder reference platform). Scope:
+
+- **Hardware bring-up:** camera capture, exposure tuning, on-device build
+  via cross-compile or native (depending on Pi 4 RAM).
+- **Native 16-bit TIFF input in C++ (deferred 3a.6):** Pi camera emits
+  12/16-bit raw; the current 8-bit PNG path crushes faint stars. Add a
+  minimal uncompressed-16-bit TIFF reader + `uint16_t` overloads for
+  `subtract_background` and `extract_centroids_adaptive_gaussian`. Drop
+  the Python preprocessing from `tools/test_real_images.py`.
+- **Camera calibration on-device:** capture a sky field, plate-solve, fit
+  k1..p2 + focal length. Persist to `data/pi_camera.json`.
+- **Live solve loop:** wall-clock end-to-end measurement on Pi 4 of
+  3e-class identification. This is the ground-truth input to Phase 3f
+  priorities.
+
+Tracking checklist deliberately left light — this phase is exploratory by
+nature.
+
+---
+
+### Phase 3f — SIMD & Cache Engineering (post-Pi)
+
+**Goal:** Beat tetra3. Target **<30ms on Pi 4, <3ms on desktop.** Only
+worth doing if the Pi measurements from the previous phase show 3e isn't
+fast enough for the application.
+
+#### 3f.1: SIMD centroiding
+
+- **NEON (Pi/M-series) + AVX2 (x86) intrinsics** in:
+  - `subtract_background` (tile median; vectorize the bilinear interp + clamp)
+  - `extract_centroids_adaptive_gaussian` (vectorize the per-tile
+    mean/stddev precompute; BFS is inherently scalar but the
+    above-threshold predicate is vectorizable)
+  - Peak-ranking partial_sort comparator (cheap to vectorize)
+- **Expected:** 3–5× on the centroid stage. Negligible if centroid isn't
+  the bottleneck post-3e; defer if so.
+
+#### 3f.2: SIMD pattern compute
+
+- Vectorize the 6 inter-star angles + sort + quantize into a single AVX2
+  / NEON lane. The compute is small (6 dot products + sort of 6 floats),
+  but it runs once per centroid candidate so the constant matters.
+
+#### 3f.3: Robin Hood hash + cache-line layout
+
+- Replace any `std::unordered_map` in the hot path with an open-addressing
+  Robin Hood table whose buckets are exactly one cache line (64 B).
+  Single cache miss per lookup vs `std::unordered_map`'s 3–4.
+
+#### 3f.4: mmap'd catalog + mlock + prefault
+
+- Replace `ifstream` catalog load with `mmap` of `catalog_patterns.bin`.
+  mlock the hot region. Prefault on startup so first-frame solve gets the
+  same latency as steady-state.
+- Eliminates the ~360 ms catalog_load stage in the benchmark.
+
+#### 3f.5: Single-FOV assumption
+
+- Skip tetra3's FOV scan entirely — we know our camera. Pre-pick the
+  pattern catalog bin at compile time or boot time.
+
+#### Phase 3f Checklist
+
+- [ ] 3f.1: SIMD centroiding (NEON + AVX2 paths)
+- [ ] 3f.2: SIMD pattern compute
+- [ ] 3f.3: Robin Hood hash
+- [ ] 3f.4: mmap + mlock + prefault catalog load
+- [ ] 3f.5: Single-FOV assumption + bin selection
+- [ ] Benchmark on Pi 4 hardware: total ≤ 30 ms median
 
 ---
 
@@ -539,23 +726,40 @@ When EKF has prior attitude, only search catalog stars within FOV + margin cone 
 | Phase 3a | 85% | < 1.0° |
 | Phase 3b | 90% | < 0.5° |
 | Phase 3c | 90% (no change) | Add timing assertions |
+| Phase 3e | 95% | < 0.1° (post pattern-hash + QUEST refine) |
+| Phase 3f | 95% (no change) | Total < 30 ms on Pi 4 |
 
 ### Key Files Modified
 
 | Files | Steps |
 |---|---|
-| `src/image_processing.cpp/.h` | 3a.2, 3a.3, 3a.4, 3b.1 |
-| `src/identification.cpp/.h` | 3a.1, 3b.3 |
+| `src/image_processing.cpp/.h` | 3a.2, 3a.3, 3a.4, 3b.1, 3f.1 |
+| `src/identification.cpp/.h` | 3a.1, 3b.3, 3e.3 (full rewrite) |
 | `src/estimation.cpp/.h` | 3b.2 |
-| `src/catalog.cpp/.h` | 3c.1, 3d.2 |
+| `src/catalog.cpp/.h` | 3c.1, 3e.2 (full rewrite), 3f.3, 3f.4, 3d.2 |
 | `src/main.cpp` | All steps |
-| `CMakeLists.txt` | New source files |
+| `CMakeLists.txt` | New source files, SIMD flags (3f) |
 | NEW: `src/camera_model.cpp/.h` | 3a.1 |
+| NEW: `src/tiff_reader.cpp/.h` | 3a.6 (during Pi integration) |
 | NEW: `src/tracking.cpp/.h` | 3d.1 |
 | `tools/generate_synthetic_data.py` | 3a.1 (distortion rendering) |
-| `tools/generate_catalog.py` | 3c.1 (k-vector generation) |
+| `tools/generate_catalog.py` | 3c.1 (k-vector), 3e.1 (pattern hash rewrite) |
 
 ### Parallelization
 
 - 3b.1 (Gaussian centroiding) and 3b.2 (QUEST) can be done in parallel
 - 3c.1 (k-vector) can be done in parallel with 3b
+- 3e.1 (pattern catalog) and 3e.2 (C++ hash loader) can be done in
+  parallel against an agreed binary format; 3e.3 (identify_stars rewrite)
+  must wait on both
+- 3f.1, 3f.2, 3f.3 are file-independent and parallelizable
+
+### Overall Sequence (current → future)
+
+```
+[done]  3a → 3b → 3c
+[next]  3e        (pattern hashing — algorithmic leap, pre-Pi)
+[then]  Pi bring-up + 3a.6  (hardware + 16-bit input)
+[then]  3f        (SIMD + cache + mmap, measured on Pi)
+[later] 3d        (EKF tracking, naturally post-Pi)
+```
