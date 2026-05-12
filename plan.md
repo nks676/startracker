@@ -1,786 +1,168 @@
 # Project Plan: *startracker*
 
-This plan outlines the iterative development approach for the highly robust embedded star tracking engine. We will start with a simple, accurate baseline, establish rigorous testing, and progressively upgrade the algorithms for performance.
+Iterative development of an embedded star-tracking engine: synthetic-data baseline → CI safety net → real-world robustness → accuracy upgrades → speed upgrades → Pi hardware integration → SIMD + tracking. Each phase is regression-tested against the prior phase's gates.
 
 ---
 
-## Phase 1: Bare Minimum Baseline — COMPLETE ✅
+## Where We Are (2026-05-11)
 
-End-to-end pipeline is functional. Achieves ~0.004° error on identity-quaternion synthetic test.
+**Current capability:** cold-start solve on alt60 ESA tetra3 fixture (1024×768, ~11° FOV, 0.4% FOV calibration drift) in **~250 ms** end-to-end on M-series desktop. Per-stage median:
 
-| Component | File | Description |
-|---|---|---|
-| Synthetic data | `tools/generate_synthetic_data.py` | Downloads Hipparcos via Vizier, renders starfield PNGs with Poisson + Gaussian noise |
-| Catalog builder | `tools/generate_catalog.py` | Builds binary star catalog and pairwise angular-distance database |
-| Accuracy checker | `tools/verify_accuracy.py` | Compares estimated quaternion against ground truth |
-| Image processing | `src/image_processing.cpp` | Connected-component BFS + Center-of-Gravity (CoG) centroiding |
-| Catalog loader | `src/catalog.cpp` | Loads binary catalog, binary-search on sorted cosine pairs |
-| Star identification | `src/identification.cpp` | Pairwise angular-distance voting with duplicate-HIP resolution |
-| Attitude estimation | `src/estimation.cpp` | TRIAD algorithm for attitude determination |
-| CLI driver | `src/main.cpp` | image → centroids → identification → TRIAD → quaternion |
+| Stage | Time |
+|---|---|
+| centroid | 13 ms |
+| catalog_load | 236 ms (~225 ms is `per_star_partners` build, not file I/O) |
+| identify (pattern hash + 24-perm probe + QUEST refine) | 2.8 ms |
+| estimate | <1 µs |
 
----
+Per-frame steady-state (catalog already loaded): **~16 ms**. Memory: 570 MB RSS.
 
-## Phase 2: End-to-End CI/CD Infrastructure — COMPLETE ✅
+**Test coverage:** 44/44 unit tests; real-image regression alt40=0.0596°, alt60=0.0000° (gate 0.5°); Monte Carlo 50 trials @ 5″ noise = 100% success, median 0.0047°, max 0.0193° (gate ≥80% / <1°).
 
-**Goal:** Before optimizing algorithms in Phase 3, create an automated safety net: unit tests, CI/CD, and Monte Carlo accuracy validation. This ensures that every future change is regression-tested.
-
----
-
-### Step 1: Add GoogleTest to the CMake Project
-
-We'll use GoogleTest (via CMake's `FetchContent`) so there are zero system dependencies to install.
-
-#### 1a. Edit `CMakeLists.txt`
-
-After the existing `add_executable(startracker ...)` block, add:
-
-```cmake
-# --- Testing ---
-include(FetchContent)
-FetchContent_Declare(
-  googletest
-  GIT_REPOSITORY https://github.com/google/googletest.git
-  GIT_TAG        v1.14.0
-)
-FetchContent_MakeAvailable(googletest)
-enable_testing()
-
-# Build core as a static library so both main and tests can link against it
-add_library(startracker_core STATIC
-    src/image_processing.cpp
-    src/catalog.cpp
-    src/identification.cpp
-    src/estimation.cpp
-)
-
-# Main executable links against the core library
-target_link_libraries(startracker PRIVATE startracker_core)
-
-# Test executable
-add_executable(startracker_tests
-    tests/test_image_processing.cpp
-    tests/test_catalog.cpp
-    tests/test_identification.cpp
-    tests/test_estimation.cpp
-)
-target_link_libraries(startracker_tests PRIVATE startracker_core GTest::gtest_main)
-
-include(GoogleTest)
-gtest_discover_tests(startracker_tests)
-```
-
-Also update the original `add_executable(startracker ...)` to only list `src/main.cpp` (since the other `.cpp` files are now in the library).
-
-#### 1b. Create `tests/` directory
-
-```bash
-mkdir -p tests
-```
-
-#### 1c. Verify the build
-
-```bash
-cd build && cmake .. && make
-```
+**Known follow-ups carried into future phases:**
+- Pattern-path hit rate on noisy synthetic Monte Carlo is **20%**; pyramid carries the rest. Root cause: synthetic Vmag~7.5 stars exceed catalog Vmag-7 cutoff, so the 8-brightest set includes non-catalog stars. Real-image fixtures hit pattern path 100%. Fix: either tighten centroid pre-filter or extend catalog to Vmag 7.5.
+- alt40 went from 0.0000° → 0.0596° during 3e.5 (inlier expansion now grabs more stars and QUEST averages over them; the "extra" stars on alt40 include some marginal matches). Still well under the 0.5° gate; investigate if it becomes a problem.
+- `per_star_partners` index is built eagerly at startup (~225 ms, ~250 MB). Lazy build on first pyramid call would cut both cold-start and idle RAM substantially, since pattern-path covers real-image traffic. Touches the Phase 3f.4 boundary.
 
 ---
 
-### Step 2: Write Unit Tests
+## Done (compressed)
 
-Create four test files. Each test file should `#include <gtest/gtest.h>` and the relevant header.
+### Phase 1 — Bare Minimum Baseline ✅
+End-to-end pipeline: synthetic-data tool, catalog builder, image processing (CC-BFS + CoG centroiding), catalog loader, pyramid identification, TRIAD attitude. ~0.004° on identity-quaternion synthetic.
 
-#### 2a. `tests/test_image_processing.cpp`
+### Phase 2 — CI/CD Infrastructure ✅
+- GoogleTest wired via `FetchContent`; `startracker_core` static lib shared by main + tests.
+- Unit tests across all four modules (catalog, image processing, identification, estimation).
+- GitHub Actions CI: build + ctest + an integration test on a single synthetic frame.
+- `tools/monte_carlo.py` aggregates random-orientation accuracy; CI nightly hook.
+- `.gitignore` excludes `build/`, `data/`, `tools/venv/`.
 
-Test `extract_centroids` on a handcrafted image buffer:
+### Phase 3a — Real-World Robustness (Image Processing Hardening) ✅
+- 3a.1: Brown-Conrady camera distortion model + `CameraModel` struct.
+- 3a.2: Background subtraction (tile median + bilinear interp).
+- 3a.3: Adaptive thresholding (per-tile `local_mean + k·local_stddev`).
+- 3a.4: Hot-pixel / outlier shape filters (min/max pixels, aspect ratio, border).
+- 3a.5: Real-image regression suite (`tools/test_real_images.py` against ESA tetra3 fixtures, in CI).
+- Bonus: pyramid identification replaced vote-based prefilter (direct `find_pairs` + `find_partners` expansion).
+- **Deferred 3a.6 (native 16-bit TIFF):** still deferred to the Pi hardware integration window.
 
-1.  **Single star test.** Create a small (e.g. 32×32) `uint8_t` buffer. Set pixels in a 3×3 block around `(16, 16)` to known intensities (e.g., center=200, neighbors=150). Call `extract_centroids` with threshold=100. Assert exactly 1 centroid is returned. Assert `centroid.x` and `centroid.y` are close to (16, 16) with `EXPECT_NEAR(..., ..., 0.5)`.
+### Phase 3b — Algorithm Upgrades (Accuracy) ✅
+- 3b.0a: peak-intensity centroid ranking; `CENTROID_CAP` 25 → 50 (60 caused pyramid noise breakdown at N≥55).
+- 3b.0b: coarse-refine-reidentify FOV scaling; absorbs the alt60 0.4% FOV calibration drift (eliminates the per-fixture `cos_tol` override).
+- 3b.1: iterative Gaussian-weighted centroiding (3–5 iters, σ=1.0 px).
+- 3b.2: QUEST attitude estimator with TRIAD fallback for degenerate input (0 fallbacks observed in MC).
+- 3b.3: identification cross-verification (median-residual prune, 3× `cos_tolerance` threshold).
+- Monte Carlo: 100% / median 0.0041° / max 0.0147°.
 
-2.  **Two stars test.** Place two non-overlapping bright spots. Assert 2 centroids returned, each near the expected position.
+### Phase 3c — Speed Optimization ✅ (partial — the algorithm-class fix was Phase 3e)
+- 3c.1: Mortari k-vector lookup over the sorted-by-cosine pair array.
+- 3c.2: `--benchmark` flag + `tools/benchmark.py` aggregator.
+- Goal of <1 s on Pi was not met by k-vector alone; that was the trigger for Phase 3e.
 
-3.  **No stars test.** All-black (or all below threshold) image. Assert 0 centroids.
+### Phase 3e — Pattern-Hash Identification ✅
+- 3e.1: 4-star Tetra-style pattern hash catalog at FOV bins 10°/15°/20° (~870k patterns each, ~21 MB each).
+- 3e.2: C++ hash loader + `find_pattern` / `find_pattern_tolerant` (sorted-array binary search + 243-key tolerant probe).
+- 3e.3: `identify_stars` rewrite — pattern lookup + 5th-star verify, pyramid kept as named fallback (`identify_stars_pyramid`).
+- 3e.4: tests + benchmark instrumentation.
+- 3e.5: query-time 24-permutation probing (deduplicates to typically 1–4 unique keys); inlier expansion + QUEST refine after verify-accept (fixes the 3e alt60 accuracy regression).
+- **Impact:** identify-stage on alt60: 18,572 ms → 2.8 ms (≈6,600× faster).
 
-4.  **Noise rejection test.** Fill image with uniform random values between 0-80, threshold=100. Assert 0 centroids (no false positives from noise alone).
-
-#### 2b. `tests/test_catalog.cpp`
-
-Use the **real Hipparcos catalog** files (`data/catalog_stars.bin` and `data/catalog_pairs.bin`) generated by `tools/generate_catalog.py`. The test fixture's `SetUp()` should load these files. If they don't exist, regenerate them by running the catalog builder as a pre-test step.
-
-Tests:
-1.  **`get_star` returns correct data** for a well-known bright star (e.g., HIP 32349 = Sirius). Verify its unit vector and magnitude match expected values.
-2.  **`get_star` throws** for a nonexistent HIP id (e.g., 999999).
-3.  **`find_pairs` returns correct results.** Pick two real catalog stars, compute their true angular distance, and verify `find_pairs` returns them within a tight cosine tolerance.
-4.  **`find_pairs` returns empty** when tolerance is zero and no exact match exists.
-
-#### 2c. `tests/test_identification.cpp`
-
-Use the **real Hipparcos catalog** loaded from the binary files to test the full identification pipeline against real star data:
-
-1.  Load the real catalog via `StarDatabase("data/catalog_stars.bin", "data/catalog_pairs.bin")`.
-2.  Create a `PinholeCamera` with known focal length and resolution.
-3.  Choose 4-5 **real catalog stars** from a known sky region (e.g., stars near the boresight direction [0, 0, 1]).
-4.  Project those real catalog unit vectors through a known rotation to get "observed" camera-frame vectors, then un-project to pixel centroids.
-5.  Call `identify_stars` with the real catalog. Assert each image star maps to the correct catalog HIP.
-6.  **False star test.** Add a centroid that doesn't correspond to any real catalog star. Assert it is *not* in the identified list.
-
-#### 2d. `tests/test_estimation.cpp`
-
-1.  **Identity rotation test.** Set camera vectors = inertial vectors (i.e., R = I). Assert quaternion ≈ [0, 0, 0, 1].
-2.  **Known 90° rotation test.** Manually rotate vectors by 90° around Z. Assert quaternion ≈ [0, 0, sin(π/4), cos(π/4)].
-3.  **Consistency check.** Generate a random rotation, apply it to get camera vectors, run TRIAD, verify the output quaternion reproduces the original rotation (angular error < 0.01°).
-
-#### 2e. Verify tests pass
-
-```bash
-cd build && cmake .. && make && ctest --output-on-failure
-```
+### Phase 3f.4 — mmap + mlock + prefault catalog ✅ (out of Phase 3f sequence — landed early as part of the post-3e polish bundle)
+- `catalog_pairs.bin`, `catalog_kvec.bin`, and the active `catalog_patterns_*.bin` are `mmap(MAP_PRIVATE, PROT_READ)` + `mlock` (best-effort, warns on `RLIMIT_MEMLOCK` failure) + explicit prefault.
+- Static asserts on `sizeof(CatalogPair)==16`, `sizeof(StarPattern)==24` guard the on-disk layout.
+- File-read portion of `catalog_load` collapsed; remaining cost (~225 ms) is `per_star_partners` index construction from the mapped pair data.
 
 ---
 
-### Step 3: Set Up GitHub Actions CI
+## Next Up
 
-#### 3a. Create `.github/workflows/ci.yml`
+### Pi 4 Hardware Integration (next phase) — IN-FLIGHT
 
-```yaml
-name: CI
-on: [push, pull_request]
+Hardware order recommended: Raspberry Pi 5 (8 GB) for dev + Pi 4 (4 GB) for deployment validation, Pi HQ Camera (Sony IMX477), 25 mm CS-mount low-distortion lens, 32 GB Class 10 microSD, USB-C 5V/5A PSU, case + ribbon cable. ~$255.
 
-jobs:
-  build-and-test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+**Bring-up scope (rough order of work once hardware arrives):**
 
-      - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+1. **OS + toolchain.** 64-bit Raspberry Pi OS, native build (Pi 5 has the RAM; cross-compile not needed). Run `cmake --build` + `ctest` on-device — should be a no-op given x86/M-series tested it. Capture an initial wall-clock baseline for each stage on Pi 4.
+2. **Native 16-bit TIFF input (the deferred 3a.6).** Pi HQ Camera emits 12/16-bit raw; the current 8-bit PNG path crushes faint stars. Add a minimal uncompressed-16-bit-grayscale TIFF reader (no compression handling needed — `libtiff` is overkill) plus `uint16_t` overloads for `subtract_background` and `extract_centroids_adaptive_gaussian`. Drop the Python preprocessing from `tools/test_real_images.py`. The ESA tetra3 TIFFs are already perfect regression data; we currently stretch them to 8-bit before feeding the binary, which is the exact gap to close.
+3. **Camera capture loop.** Tiny utility that grabs a frame via `libcamera`/`picamera2`, writes a 16-bit TIFF, pipes the path to the existing binary. Probably a Python wrapper for the first cut.
+4. **Camera calibration.** Capture 10+ sky frames at known orientations (or use `solve-field` for plate solving). Fit Brown-Conrady k1..p2 + focal length + principal point. Persist to `data/pi_camera.json`. Wrap as `tools/calibrate_camera.py` so it's repeatable.
+5. **First-night validation.** Solve a real captured frame end-to-end on the Pi. Report accuracy + per-stage timing. This is the input to Phase 3f priorities.
 
-      - name: Build
-        run: cmake --build build --parallel
+**Pre-Pi prep that could happen now (don't strictly need hardware):**
+- 3a.6 TIFF reader (portable code; ESA TIFFs are regression data).
+- ARM64 cross-compile lane in CI (catches alignment / endianness / missing-intrinsics bugs before flashing an SD card).
+- Camera-calibration tool scaffold (the math is hardware-independent; just needs sample images).
 
-      - name: Unit Tests
-        run: cd build && ctest --output-on-failure
+### Phase 3f — SIMD & Cache Engineering (post-Pi measurement)
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
+Only worth doing if the on-Pi measurement from the previous phase shows we're slower than the application needs. Target if pursued: **<30 ms total on Pi 4, <3 ms on desktop.**
 
-      - name: Install Python deps
-        run: pip install -r tools/requirements.txt
-
-      - name: Integration Test (single image)
-        run: |
-          cd tools
-          python generate_synthetic_data.py --quat 0 0 0 1 --out ../data/ci_test
-          python generate_catalog.py
-          cd ..
-          ./build/startracker data/ci_test/synthetic_starfield.png data/catalog_stars.bin data/catalog_pairs.bin 20 | tee result.txt
-          QUAT=$(grep "Estimated Quaternion:" result.txt | sed 's/Estimated Quaternion: \[//;s/\]//;s/,//g')
-          cd tools
-          python verify_accuracy.py --truth ../data/ci_test/truth.json --est $QUAT
-```
-
-#### 3b. Push and verify the workflow runs green
-
-```bash
-git add .github/
-git commit -m "Add CI workflow"
-git push
-```
-
----
-
-### Step 4: Monte Carlo Accuracy Validation
-
-This is a Python script that generates many random orientations, runs the C++ engine on each, and reports aggregate statistics. This is the most important part of Phase 2 — it tells you *how robust* the baseline really is.
-
-#### 4a. Create `tools/monte_carlo.py`
-
-The script should:
-
-1.  Accept CLI args: `--num-trials` (default 100), `--fov`, `--res`, `--noise`.
-2.  For each trial:
-    *   Generate a random unit quaternion: `q = np.random.randn(4); q /= np.linalg.norm(q); if q[3] < 0: q = -q` (canonical positive-w).
-    *   Call `generate_synthetic_data.py`'s `generate_image()` function directly (import it, don't subprocess).
-    *   Run the C++ `startracker` binary via `subprocess.run()`, parse the `Estimated Quaternion:` line from stdout.
-    *   Compute angular error using `scipy.spatial.transform.Rotation`.
-    *   Record: trial index, ground-truth quat, estimated quat, angular error, number of stars identified.
-3.  After all trials, print:
-    *   **Success rate** (% of trials with error < 1°).
-    *   **Median / Mean / Max / 95th percentile** angular error of successful trials.
-    *   **Failure cases** (error > 5° or "Not enough stars identified") with their ground-truth quaternions for debugging.
-4.  Save results to a CSV: `data/monte_carlo_results.csv`.
-
-#### 4b. Run the Monte Carlo
-
-```bash
-cd tools && source venv/bin/activate
-python monte_carlo.py --num-trials 50 --fov 20 --noise 5
-```
-
-Review the results. If success rate is below ~80%, the identification stage likely needs the fixes from the Phase 1 review (especially issues #3 and #4). Fix and re-run until you're confident in the baseline.
-
-#### 4c. Add Monte Carlo to CI (optional, as a nightly job)
-
-Since Monte Carlo is slow (~5-10 min for 50 trials), you can add it as a separate GitHub Actions workflow triggered on `schedule` (cron) or `workflow_dispatch` rather than every push.
-
----
-
-### Step 5: Add a `.gitignore` and Clean Up
-
-#### 5a. Create `.gitignore`
-
-```
-build/
-data/
-tools/venv/
-tools/hipparcos_cached.npy
-*.pyc
-__pycache__/
-```
-
-#### 5b. Final commit
-
-
-```bash
-git add -A
-git commit -m "Phase 2: unit tests, CI/CD, Monte Carlo validation"
-```
-
----
-
-### Phase 2 Checklist
-
-- [x] Step 1: GoogleTest in CMake, `startracker_core` library
-- [x] Step 2a: `tests/test_image_processing.cpp`
-- [x] Step 2b: `tests/test_catalog.cpp` (real Hipparcos catalog)
-- [x] Step 2c: `tests/test_identification.cpp` (real Hipparcos catalog)
-- [x] Step 2d: `tests/test_estimation.cpp`
-- [x] Step 2e: All tests passing in `ctest`
-- [x] Step 3: `.github/workflows/ci.yml` running green
-- [x] Step 4a: `tools/monte_carlo.py` written
-- [x] Step 4b: Monte Carlo results reviewed, success rate acceptable
-- [x] Step 5: `.gitignore`, clean commit
-
----
-
-## Phase 3: Algorithm Optimization, Real-World Robustness & Tracking
-
-With CI/CD in place, we iteratively upgrade algorithms, harden the pipeline for real camera images, and add frame-to-frame tracking. Each step is regression-tested against the existing test suite.
-
----
-
-### Phase 3a — Real-World Robustness (Image Processing Hardening)
-
-**Goal:** Make the pipeline work on real star field images from cameras like PiFinder (Raspberry Pi HQ Camera + CS-mount lens), not just clean synthetic data.
-
-#### 3a.1: Camera Distortion Model
-
-Replace the simple `PinholeCamera` struct with a full `CameraModel` class using the Brown-Conrady distortion model (k1, k2, k3 radial + p1, p2 tangential). This is the same model OpenCV and astrometry.net use.
-
-- **New files:** `src/camera_model.h`, `src/camera_model.cpp`
-- **Key methods:** `undistort_to_unit_vector(px, py)` (iterative Newton's method), `project(v_cam)` (forward projection with distortion)
-- **Refactor:** `identify_stars()` accepts `CameraModel&` instead of `PinholeCamera`. Replace inline pixel→unit-vector conversion with camera model call.
-- **Update:** `generate_synthetic_data.py` gains `--distortion k1 k2 p1 p2 k3` flag for rendering distorted test images.
-- **Why first:** Without distortion correction, stars near image edges have arcminute-level errors that break identification. Every subsequent improvement depends on correct unit vectors.
-
-**Tests:**
-- Round-trip: project → undistort, verify recovered unit vector matches within 1e-8
-- Zero-distortion produces identical results to old `PinholeCamera`
-- Monte Carlo with k1=-0.3 (typical PiFinder barrel distortion)
-
-#### 3a.2: Background Subtraction
-
-New preprocessing step before centroiding. Median filter with large kernel (32×32 or 64×64) estimates the background, then subtract it. Removes vignetting gradients, light pollution, sensor glow.
-
-- **Modify:** `src/image_processing.cpp` — new `subtract_background()` function
-- **Tests:** Linear gradient + point sources → verify centroids preserved, gradient removed
-
-#### 3a.3: Adaptive Thresholding
-
-Replace the hardcoded `threshold=100` with local sigma-clipping. For each tile (64×64), threshold = local_mean + k × local_stddev. Standard approach in astronomical source extraction (SExtractor, SEP).
-
-- **Modify:** `src/image_processing.cpp` — new `extract_centroids_adaptive()` function
-- **Keep:** Old `extract_centroids()` with fixed threshold for backward-compatible unit tests
-- **Tests:** Image with two quadrants at different background levels — fixed threshold fails, adaptive succeeds
-
-#### 3a.4: Hot Pixel / Outlier Rejection
-
-Filter connected components by shape to reject artifacts:
-- Min pixel count > 1 (reject single-pixel hot pixels)
-- Max pixel count < 200 (reject extended objects, satellite trails)
-- Aspect ratio < 3:1 (reject streaks)
-- Border margin > 5px (reject edge artifacts)
-
-- **Modify:** `src/image_processing.cpp`
-- **Tests:** Single hot pixel rejected, long streak rejected
-
-#### 3a.5: Real Image Test Pipeline
-
-Source real star field images and integrate them into testing.
-
-- **Image sources:** ESA Tetra3 dataset, astrometry.net sample images, user-captured photos (PiFinder, DSLR)
-- **Ground truth:** Plate-solve with astrometry.net's `solve-field` to get WCS → convert to quaternion
-- **New files:**
-  - `tools/download_test_images.py` — downloads curated test image set
-  - `tools/plate_solve.py` — wrapper around `solve-field`, outputs truth JSON
-  - `tests/test_real_images.sh` — loops over `data/real_images/*/`, runs tracker, checks accuracy
-- **Directory structure:**
-  ```
-  data/real_images/
-    image_001/
-      image.png
-      camera.json   (fx, fy, cx, cy, k1, k2, p1, p2, k3)
-      truth.json    (quaternion_xyzw)
-  ```
-- **Threshold:** < 5° initially (tighten as calibration improves). Non-blocking in CI at first (`continue-on-error: true`)
-
-#### Phase 3a Checklist
-
-- [x] 3a.0: Catalog mag cutoff 6.0 → 7.0 (added during smoke test)
-- [x] 3a.1: Camera distortion model (Brown-Conrady)
-- [x] 3a.2: Background subtraction
-- [x] 3a.3: Adaptive thresholding
-- [x] 3a.4: Hot pixel / outlier rejection
-- [x] 3a.5: Real image test pipeline (tools/test_real_images.py, in CI)
-- [x] Bonus (moved from 3b.3): pyramid identification — direct catalog
-      pair search + geometric expansion. Vote-based prefiltering was
-      structurally biased toward dense sky regions; pyramid expansion
-      uses StarDatabase::find_partners for O(log P) seed extension.
-- [x] Monte Carlo success rate ≥ 85% — actually 100% (median 0.008°)
-- Real-image regression: Alt40 0.04°, Alt60 0.00° (ESA tetra3 samples)
-- [ ] **3a.6 (deferred): Native 16-bit TIFF input in C++.** Currently
-      `tools/test_real_images.py` does a calibrated TIFF→PNG stretch in
-      Python before feeding the binary; the binary itself only ingests
-      8-bit PNG via `stb_image`. To go pure C++ (matters for embedded
-      deployment and for preserving full dynamic range so faint stars
-      don't get crushed into noise), add a minimal uncompressed-16-bit-
-      grayscale TIFF reader + `uint16_t` overloads for
-      `subtract_background` and `extract_centroids_adaptive`, then drop
-      the Python preprocessing from `tools/test_real_images.py`. Defer
-      until real-hardware integration — the model evaluation pipeline is
-      bit-depth-agnostic at the centroid level and current results are
-      not affected.
-
----
-
-### Phase 3b — Algorithm Upgrades (Accuracy)
-
-**Goal:** Replace baseline algorithms with state-of-the-art, statistically optimal versions. These are the resume-worthy upgrades.
-
-#### 3b.0: Identification robustness (carried over from 3a)
-
-Two limitations observed during 3a real-image testing that didn't block
-shipping 3a but should be addressed before 3b.1/3b.2 work piles more
-demands on identification.
-
-**3b.0a — Pyramid scaling beyond N=25.** `main.cpp` currently caps centroids
-to `CENTROID_CAP=25` before identification because the pyramid algorithm is
-O(N²) over seed pairs and grows noisy when N is dominated by faint stars
-that aren't in the mag<7 catalog. Two ways to lift the cap:
-- (a) Rank centroids by a quality metric before passing to identification
-  — peak intensity or shape compactness, not sum-of-intensity (which
-  favors saturated blobs). 8-bit clipping inflates the "intensity" of
-  saturated regions; once 3a.6 lands and we're working on 16-bit data,
-  sum-of-intensity becomes meaningful again.
-- (b) Switch the pyramid's seed enumeration to RANSAC sampling (O(K)
-  trials instead of O(N²) seed pairs). Bounded runtime regardless of N.
-
-**3b.0b — Scale-invariant identification.** The `alt60` real-image fixture
-uses `cos_tol=2e-5` instead of the synthetic default `1e-5` to absorb a
-~0.4% FOV calibration error on the tetra3 IMX265 camera. Without the
-override, identification fails on that fixture. Three possible fixes:
-- (a) Coarse identify → refine FOV from matched pair geometry → re-identify.
-- (b) Replace pair-angle features with scale-invariant triplet ratios
-  (eliminates absolute scale from the matching problem entirely).
-- (c) Grid-search a small ladder of FOV scalings during identification
-  and keep whichever produces the most inliers.
-
-Pick whichever fits naturally alongside QUEST work (3b.2). The per-fixture
-override is a documentation-only patch, not a fundamental fix.
-
-#### 3b.1: Iterative Weighted Gaussian Centroiding
-
-Replace Center-of-Gravity (CoG) with Gaussian-weighted iterative centroiding. After BFS finds the connected component, run 3-5 iterations:
-```
-for each iteration:
-  w = exp(-((px - cx)² + (py - cy)²) / (2σ²))
-  cx = Σ(px × I × w) / Σ(I × w)
-  cy = Σ(py × I × w) / Σ(I × w)
-```
-
-Improves sub-pixel accuracy from ~0.1px (CoG) to ~0.01-0.05px. At f=2903px (20° FOV on 1024×1024), this reduces pointing error from ~7 arcsec to ~1 arcsec.
-
-- **Modify:** `src/image_processing.cpp`
-- **Tests:** Sub-pixel-offset Gaussian PSF — verify Gaussian centroid is closer to true center than CoG
-
-#### 3b.2: QUEST Attitude Estimator
-
-Replace TRIAD with QUEST (Shuster & Oh 1981) — the optimal solution to Wahba's problem. Uses ALL N identified stars (TRIAD only uses the best 2).
-
-**Algorithm:**
-1. Compute B matrix: `B = Σ(aᵢ × wᵢ × vᵢᵀ)` (weighted outer products of camera/inertial vectors)
-2. Compute S, σ, Z from B
-3. Newton-Raphson on characteristic equation for largest eigenvalue λ_max
-4. Compute optimal quaternion from λ_max
-
-- **Modify:** `src/estimation.cpp` — replace body of `estimate_attitude()`, keep same signature
-- **Fallback:** If Newton-Raphson fails to converge (degenerate/collinear stars), fall back to TRIAD
-- **Resume value:** Industry gold standard — every spacecraft attitude paper references QUEST
-- **Tests:**
-  - Existing tests still pass (identity, 90° rotation, random)
-  - N=5 stars with noise: QUEST produces lower error than TRIAD
-  - N=2: QUEST matches TRIAD within numerical precision
-
-#### 3b.3: Identification Cross-Verification
-
-Post-processing step after voting: verify that angular distances between ALL pairs of identified stars match the catalog. Reject stars that fail the cross-check.
-
-- **Modify:** `src/identification.cpp` — ~20 lines after duplicate resolution
-- **Tests:** Inject deliberately misidentified star → verify cross-check removes it
-- **Impact:** Fewer catastrophic failures (>5° errors)
-
-#### Phase 3b Checklist
-
-- [x] 3b.0a: Peak-intensity ranking; CENTROID_CAP raised from 25 → 50
-      (60 caused pyramid noise breakdown on dense real-image scenes)
-- [x] 3b.0b: Coarse-refine-reidentify FOV scaling; absorbs the 0.4% FOV
-      calibration drift on alt60 (no per-fixture cos_tol override)
-- [x] 3b.1: Gaussian centroiding
-- [x] 3b.2: QUEST attitude estimator (TRIAD fallback, 0 fallbacks in MC)
-- [x] 3b.3: Identification cross-verification
-- [x] Monte Carlo success rate ≥ 90% — actually 100%, median 0.0041°,
-      max 0.0147° (well under 0.5° per-trial threshold)
-- Real-image regression: alt40 0.0000°, alt60 0.0000°
-
----
-
-### Phase 3c — Speed Optimization
-
-**Goal:** Target <1 second on Raspberry Pi 4, <100ms on desktop.
-
-#### 3c.1: K-Vector Search (Mortari 2004)
-
-Replace binary search in `find_pairs()` with Mortari's k-vector for O(1) lookup. Precompute an index array mapping quantized cosine values to pair ranges in the sorted array.
-
-- **Modify:** `tools/generate_catalog.py` — generate `data/catalog_kvec.bin`
-- **Modify:** `src/catalog.cpp` — new `find_pairs_kvec()` method
-- **Tests:** Verify identical results to binary search, benchmark 10K lookups
-- **Resume value:** "Implemented Mortari's k-vector O(1) catalog search" — cited in virtually every star tracker paper
-
-#### 3c.2: Benchmarking Framework
-
-- **New file:** `tools/benchmark.py` — runs tracker on fixed image set, reports per-stage timings
-- **Modify:** `src/main.cpp` — `std::chrono` instrumentation behind `--benchmark` flag
-- **Output:** Centroiding time, identification time, estimation time, total time, memory usage
-
-#### Phase 3c Checklist
-
-- [x] 3c.1: K-vector search (936922 bins, dq=1e-7; parity verified vs.
-      binary search over 1000 random queries)
-- [x] 3c.2: Benchmarking framework (`tools/benchmark.py`, `--benchmark`
-      flag on the binary)
-- [x] Benchmark baseline established (post-3b/3c, macOS Release):
-      alt40 identify=5.4s, alt60 identify=18.6s (median). Identify-stage
-      cost grew vs. W5's pre-merge baseline because CAP rose 25→50 and
-      W3's coarse-refine wrapper runs an extra pass on miscalibrated
-      cameras. **The 3c "speed optimization" goal of <1s on Pi 4 was not
-      met by k-vector alone — it's an algorithm-class problem, not a
-      tuning problem. See Phase 3e.**
-
----
-
-### Speed Reality Check + Sequencing Decision (post-3c)
-
-After Phase 3b/3c shipped, alt60 cold-start is **~19s on M-series desktop**.
-That's unusable for any practical iteration loop, let alone the <1s Pi 4 goal.
-Root cause is structural: pairwise pyramid identification is **O(N²) seed
-pairs × O(log P) catalog lookups × O(N) expansion**, and k-vector replaced
-only the log-P lookup with a constant factor — it didn't change the
-exponent. Tetra3 (the open-source plate solver that PiFinder uses) takes
-**50–300ms on a Pi 4** because it uses a fundamentally different algorithm:
-hash-based pattern lookup, not pairwise voting. Closing the gap requires
-adopting that algorithm class.
-
-**Sequencing decision (2026-05-11):** Phase **3e (pattern hashing) goes
-before** Pi-hardware integration. Phase **3f (SIMD + cache + mmap) goes
-after**. Reasons:
-
-- 19s solve time makes Pi iteration unproductive — every test cycle is dead
-  time. tetra3-class ~100ms is the floor where the Pi becomes usable.
-- 3e rewrites the catalog binary format. If Pi tooling (capture, calibration,
-  deployment) is built against the current cosine-pair format, then 3e
-  replaces it, you redo that integration work twice.
-- 3f is architecture-specific. NEON ≠ AVX2, Pi cache hierarchy ≠ M-series,
-  and the real bottleneck on Pi (thermal, USB camera bandwidth, mmap fault
-  latency on SD) may not be what desktop benchmarks predict. Measure first.
-
-**Sequence:** 3e → Pi integration (+ deferred 3a.6) → 3f → 3d.
-Phase 3d (EKF tracking) needs frame sequences which only the Pi will
-provide naturally; it moves to after Pi too.
-
----
-
-### Phase 3e — Pattern-Hash Identification
-
-**Goal:** Replace pairwise pyramid voting with tetra3-style 4-star pattern
-hashing. Target post-3e: **5–20ms on desktop, 50–200ms on Pi 4.**
-
-This is the load-bearing speed change; without it, Phase 3f's
-micro-optimizations are wasted on the wrong algorithm.
-
-**Algorithm overview:**
-
-For each star S in the catalog, find its 3 nearest neighbors A, B, C within
-FOV/2. Compute the 6 pairwise angular distances among {S, A, B, C}. Sort
-the 6 distances ascending; normalize all six by the largest (yielding 5
-ratios in [0, 1]); quantize each ratio to ~10 bits; pack the 5 quantized
-values into a single 64-bit hash key. Insert (key → 4-tuple of HIPs) into a
-hash table. At query time: pick the brightest centroid, repeat the same
-computation, single hash lookup, verify the candidate 4-tuple against one
-or two additional observed stars, return on first acceptance.
-
-#### 3e.1: Pattern catalog generation
-
-- **Modify:** `tools/generate_catalog.py` — emit a new binary
-  `data/catalog_patterns.bin` (per FOV bin) replacing/supplementing
-  `catalog_pairs.bin`. Format: `[int32 num_buckets, int32 fov_bin_deg,
-  int32 num_patterns, num_patterns × (uint64 key, int32[4] hips)]`. Bucket
-  count chosen so load factor ~0.5.
-- **Multi-FOV bins:** Generate one catalog at each of {5°, 10°, 15°, 20°}.
-  At runtime, pick the bin closest to the camera's FOV.
-- **Catalog size estimate:** N=15544 stars × C(8 nearest, 3) ≈ 870k patterns
-  per FOV. ~30 MB per bin on disk; ~100 MB total across 4 bins. Acceptable.
-
-#### 3e.2: C++ hash table loader + query
-
-- **Rewrite:** `src/catalog.{h,cpp}` — replace `find_pairs`/`find_pairs_kvec`
-  with `find_pattern(uint64 key) → vector<array<int, 4>>`. Use open-
-  addressing Robin Hood hash for cache-friendly probes (1 cache miss per
-  lookup in the common case).
-- **Keep:** `get_star(hip)` and the star-position table as-is; pattern hash
-  only changes the *search* index, not the underlying star data.
-
-#### 3e.3: Replace identify_stars with pattern lookup
-
-- **Rewrite:** `src/identification.{h,cpp}` — replace the pyramid loop with:
-  1. Take the brightest 6–8 centroids (peak-ranked).
-  2. For the brightest, compute its pattern key using its 3 nearest
-     neighbors among the chosen centroids.
-  3. Lookup → list of candidate 4-tuples. For each: solve attitude on the
-     4 stars (TRIAD), project a 5th observed star, accept if it lands
-     within 0.05° of its predicted position.
-  4. First acceptance wins → QUEST refines on all 4–6 inliers.
-- **Multi-key probing:** Quantization can drop a ratio across a bucket
-  boundary. Probe the key and its 5 ±1-in-one-dim neighbors. (32 keys
-  in worst case if we go ±1 in all dims; usually 1 hit suffices.)
-- **Fallback:** if no pattern matches after trying patterns from the top 4
-  brightest centroids, fall back to the existing pyramid path (slow but
-  thorough). Keeps current pyramid code in place as a safety net.
-
-#### 3e.4: Tests + benchmark gate
-
-- **Tests:** `tests/test_pattern_hash.cpp` — pattern roundtrip
-  (catalog → pattern → catalog), real-image regression unchanged, Monte
-  Carlo 100 trials.
-- **Benchmark gate:** `tools/benchmark.py` must show alt40 + alt60 total
-  < 100ms on desktop. (Pi target unverifiable until hardware exists; treat
-  100ms desktop as proxy.)
-- **Resume value:** "Implemented tetra3-style 4-star pattern hashing in
-  C++; achieved <X ms on commodity hardware."
-
-#### Phase 3e Checklist
-
-- [x] 3e.1: Pattern catalog generation — 3 FOV bins (10°, 15°, 20°),
-      ~870k patterns per bin, ~21 MB each. Wall-clock ~9 s per bin.
-- [x] 3e.2: C++ hash loader + `find_pattern` / `find_pattern_tolerant`.
-- [x] 3e.3: identify_stars rewrite — pattern lookup + 5th-star verify,
-      pyramid kept as named fallback (`identify_stars_pyramid`).
-- [x] 3e.4: Tests + benchmark — **identify stage met its target**
-      (alt60: 18,572 ms → 1.94 ms; alt40: 5,377 ms → 0.4 ms). The
-      <100ms-total gate is **not** met because `catalog_load` reads
-      99 MB of pair data at ~360 ms; that's Phase 3f.4 (mmap+mlock).
-- [x] Monte Carlo ≥ 95% — actually 100% (median 0.0041°, max 0.0197°).
-- Real-image regression: alt40 0.0000°, alt60 0.1074° (well under 0.5°).
-
-**Known follow-ups (deferred from 3e):**
-
-- **Pattern-path hit rate on Monte Carlo is ~20%**; the other 80% fall
-  back to pyramid. Root cause: canonical-order key generation sorts the
-  6 inter-star angles, so centroid noise that flips two near-equal
-  angle ranks shifts the key to a non-adjacent bucket, where ±1
-  tolerant probing cannot find it. Real images (well-separated star
-  geometry) hit the pattern path 100%; synthetic-with-noise hits 20%.
-- **Fix path:** mirror tetra3's choice — at query time, compute the key
-  for all 24 star-permutations and probe each, instead of relying on
-  one canonical ordering. 24× lookups still well within the µs budget.
-  Bundle into Phase 3f or as a 3e.5 patch.
-- **Catalog load is now the dominant cost** (~360 ms / 99 MB pair file).
-  Phase 3f.4 (mmap + mlock + prefault) is explicitly targeted at this.
-
----
-
-### Pi 4 Hardware Integration (between 3e and 3f)
-
-After 3e lands and identification is fast enough to be usable, the project
-moves onto the target hardware: Raspberry Pi 4 + HQ Camera + CS-mount
-lens (the PiFinder reference platform). Scope:
-
-- **Hardware bring-up:** camera capture, exposure tuning, on-device build
-  via cross-compile or native (depending on Pi 4 RAM).
-- **Native 16-bit TIFF input in C++ (deferred 3a.6):** Pi camera emits
-  12/16-bit raw; the current 8-bit PNG path crushes faint stars. Add a
-  minimal uncompressed-16-bit TIFF reader + `uint16_t` overloads for
-  `subtract_background` and `extract_centroids_adaptive_gaussian`. Drop
-  the Python preprocessing from `tools/test_real_images.py`.
-- **Camera calibration on-device:** capture a sky field, plate-solve, fit
-  k1..p2 + focal length. Persist to `data/pi_camera.json`.
-- **Live solve loop:** wall-clock end-to-end measurement on Pi 4 of
-  3e-class identification. This is the ground-truth input to Phase 3f
-  priorities.
-
-Tracking checklist deliberately left light — this phase is exploratory by
-nature.
-
----
-
-### Phase 3f — SIMD & Cache Engineering (post-Pi)
-
-**Goal:** Beat tetra3. Target **<30ms on Pi 4, <3ms on desktop.** Only
-worth doing if the Pi measurements from the previous phase show 3e isn't
-fast enough for the application.
-
-#### 3f.1: SIMD centroiding
-
-- **NEON (Pi/M-series) + AVX2 (x86) intrinsics** in:
-  - `subtract_background` (tile median; vectorize the bilinear interp + clamp)
-  - `extract_centroids_adaptive_gaussian` (vectorize the per-tile
-    mean/stddev precompute; BFS is inherently scalar but the
-    above-threshold predicate is vectorizable)
-  - Peak-ranking partial_sort comparator (cheap to vectorize)
-- **Expected:** 3–5× on the centroid stage. Negligible if centroid isn't
-  the bottleneck post-3e; defer if so.
-
-#### 3f.2: SIMD pattern compute
-
-- Vectorize the 6 inter-star angles + sort + quantize into a single AVX2
-  / NEON lane. The compute is small (6 dot products + sort of 6 floats),
-  but it runs once per centroid candidate so the constant matters.
-
-#### 3f.3: Robin Hood hash + cache-line layout
-
-- Replace any `std::unordered_map` in the hot path with an open-addressing
-  Robin Hood table whose buckets are exactly one cache line (64 B).
-  Single cache miss per lookup vs `std::unordered_map`'s 3–4.
-
-#### 3f.4: mmap'd catalog + mlock + prefault
-
-- Replace `ifstream` catalog load with `mmap` of `catalog_patterns.bin`.
-  mlock the hot region. Prefault on startup so first-frame solve gets the
-  same latency as steady-state.
-- Eliminates the ~360 ms catalog_load stage in the benchmark.
-
-#### 3f.5: Single-FOV assumption
-
-- Skip tetra3's FOV scan entirely — we know our camera. Pre-pick the
-  pattern catalog bin at compile time or boot time.
-
-#### Phase 3f Checklist
-
-- [ ] 3f.1: SIMD centroiding (NEON + AVX2 paths)
-- [ ] 3f.2: SIMD pattern compute
-- [ ] 3f.3: Robin Hood hash
-- [ ] 3f.4: mmap + mlock + prefault catalog load
-- [ ] 3f.5: Single-FOV assumption + bin selection
-- [ ] Benchmark on Pi 4 hardware: total ≤ 30 ms median
-
----
+- **3f.1 SIMD centroiding.** NEON (Pi/M-series) + AVX2 (x86) intrinsics in `subtract_background` (tile median + bilinear interp + clamp) and `extract_centroids_adaptive_gaussian` (per-tile mean/stddev precompute; BFS itself is scalar but the above-threshold predicate vectorizes). Expected: 3–5× on the centroid stage.
+- **3f.2 SIMD pattern compute.** Vectorize the 6 inter-star angles + sort + quantize into a single AVX2/NEON lane. Small absolute compute but runs 24× per query post-3e.5.
+- **3f.3 Robin Hood hash for the pattern table.** Currently a sorted vector + binary search — single cache miss per probe is roughly equivalent in practice. Only revisit if profiling on Pi shows the binary search is bottlenecked.
+- **~~3f.4 mmap + mlock + prefault catalog.~~** **DONE** (out of sequence — landed in the post-3e polish bundle). Need to revisit on Pi for `mlock` behavior under default `RLIMIT_MEMLOCK`.
+- **3f.5 Single-FOV assumption.** Pre-pick the pattern catalog bin at boot rather than per-frame. Trivial; mostly bookkeeping.
+- **Phase 3f.x (new candidate): defer `per_star_partners` construction.** Currently builds eagerly at startup (~225 ms, ~250 MB). After 3e.5 the pyramid is fallback-only; lazy-build (or drop entirely if the synthetic-noise pattern miss rate gets fixed) is the next biggest cold-start win.
 
 ### Phase 3d — Tracking Mode (Extended Kalman Filter)
 
-**Goal:** Add frame-to-frame attitude tracking for continuous operation, with reduced catalog search using prior attitude.
+Needs frame sequences which the Pi capture loop provides naturally. Algorithm scope unchanged from the original plan:
 
-#### 3d.1: Multiplicative EKF (MEKF)
+- **3d.1 Multiplicative EKF (MEKF).** 6-state (3 rotation error + 3 angular velocity). Multiplicative error quaternion avoids the norm-constraint snag. Predict via angular velocity propagation; update from identified star measurements.
+- **3d.2 Reduced catalog search.** When EKF has prior attitude, restrict identification to catalog stars within a FOV+margin cone of the predicted boresight. Requires a coarse spatial index (declination binning or HEALPix). On Pi this is a big win for steady-state per-frame cost.
+- **3d.3 Simulated gyro.** Add `GyroModel` with bias + noise. Expand EKF state to 9 (+ 3 gyro bias). Generate simulated gyro from truth-quaternion sequences for testing in CI without hardware IMU.
+- **CLI:** new `--tracking` mode in `main.cpp` that accepts a frame stream and emits a quaternion stream.
 
-New mode added on top of the existing lost-in-space pipeline.
+### Known Follow-ups Backlog
 
-- **New files:** `src/tracking.h`, `src/tracking.cpp`
-- **State model:** 6-state MEKF (3 rotation error + 3 angular velocity). Uses multiplicative error quaternion to avoid norm constraint issues.
-- **Predict:** Propagate quaternion using angular velocity model
-- **Update:** Use identified star vectors as measurements, compute Kalman gain
-- **CLI:** New `--tracking` mode in `main.cpp` for image sequences
-- **Resume value:** "Extended Kalman Filter for real-time attitude tracking" — fundamental in spacecraft GNC
+These don't fit cleanly into one phase but should be addressed before "ship it":
 
-**Tests:**
-- Init with known attitude, predict forward, verify predicted quaternion
-- 20-frame smooth rotation trajectory: EKF tracks with <0.1° error
-- 10 random trajectories Monte Carlo
-
-#### 3d.2: Reduced Catalog Search
-
-When EKF has prior attitude, only search catalog stars within FOV + margin cone around predicted boresight. Requires spatial index on catalog (declination binning or HEALPix).
-
-- **Modify:** `src/catalog.cpp` — spatial index
-- **Impact:** Dramatically faster identification in tracking mode
-
-#### 3d.3: Simulated Gyro Model
-
-`GyroModel` struct with bias and noise parameters. EKF state expands to 9 (+ 3 gyro bias). Generate simulated gyro data from truth quaternion sequences for testing.
-
-- **New:** Gyro model in `src/tracking.cpp`
-- **Tests:** EKF converges with gyro + star measurements, bias estimate converges
-
-#### Phase 3d Checklist
-
-- [ ] 3d.1: MEKF core (predict + update)
-- [ ] 3d.2: Reduced catalog search
-- [ ] 3d.3: Simulated gyro model
-- [ ] Tracking-mode Monte Carlo (10 trajectories × 20 frames)
+- **Pattern-path noise robustness on Monte Carlo.** Currently 20% hit rate; pyramid carries the rest. Either (a) tighten the centroid pre-filter so we only pass mag-7-and-brighter, or (b) regenerate the pattern catalog with `max_mag=7.5` so the noisy 8-brightest set has full coverage. Option (b) costs ~2× catalog size; option (a) costs noise robustness on real frames where mag-7-and-brighter is the *upper* bound. Decide after Pi data.
+- **alt40 accuracy.** Went from 0.0000° → 0.0596° during 3e.5. Investigate which marginal inliers QUEST is averaging.
+- **3e.5 unit tests not landed.** Empirical validation (real-image + MC) covers the regression but the three tests requested in the 3e.5 spec (`PermutationProbeFindsKey`, `NoiseRobustnessSweep`, `AccuracyAfterVerify`) were skipped by the subagent. Add them when convenient.
 
 ---
 
-### Monte Carlo Threshold Progression
+## Verification Gates
 
-| After | Min Success Rate | Per-Trial Threshold |
+| Gate | Current | Pre-Pi target |
 |---|---|---|
-| Phase 2 (current) | 80% | < 1.0° |
-| Phase 3a | 85% | < 1.0° |
-| Phase 3b | 90% | < 0.5° |
-| Phase 3c | 90% (no change) | Add timing assertions |
-| Phase 3e | 95% | < 0.1° (post pattern-hash + QUEST refine) |
-| Phase 3f | 95% (no change) | Total < 30 ms on Pi 4 |
+| `ctest` | 44/44 | maintained |
+| Real-image alt40 / alt60 | 0.0596° / 0.0000° | both < 0.1° after alt40 investigation |
+| Monte Carlo success rate | 100% | maintained ≥ 95% |
+| Monte Carlo median error | 0.0047° | maintained ≤ 0.01° |
+| Cold-start total (alt60, desktop) | 250 ms | target after 3a.6 + cross-compile CI: still 250 ms (no change expected) |
+| Per-frame steady-state (alt60, desktop) | 16 ms | maintained |
+| Pi 4 cold-start total | unmeasured | <500 ms (initial gate; refine after measuring) |
+| Pi 4 per-frame steady-state | unmeasured | <100 ms (initial gate; <30 ms is the 3f stretch goal) |
 
-### Key Files Modified
+---
 
-| Files | Steps |
+## Key Files
+
+| File | Owners |
 |---|---|
-| `src/image_processing.cpp/.h` | 3a.2, 3a.3, 3a.4, 3b.1, 3f.1 |
-| `src/identification.cpp/.h` | 3a.1, 3b.3, 3e.3 (full rewrite) |
-| `src/estimation.cpp/.h` | 3b.2 |
-| `src/catalog.cpp/.h` | 3c.1, 3e.2 (full rewrite), 3f.3, 3f.4, 3d.2 |
-| `src/main.cpp` | All steps |
-| `CMakeLists.txt` | New source files, SIMD flags (3f) |
-| NEW: `src/camera_model.cpp/.h` | 3a.1 |
-| NEW: `src/tiff_reader.cpp/.h` | 3a.6 (during Pi integration) |
-| NEW: `src/tracking.cpp/.h` | 3d.1 |
-| `tools/generate_synthetic_data.py` | 3a.1 (distortion rendering) |
-| `tools/generate_catalog.py` | 3c.1 (k-vector), 3e.1 (pattern hash rewrite) |
+| `src/image_processing.{h,cpp}` | 3a.2/3/4, 3b.1, 3a.6 (TIFF), future 3f.1 |
+| `src/identification.{h,cpp}` | 3a.1, 3b.0b/3, 3e.3/5, future 3f.x (per_star_partners defer) |
+| `src/catalog.{h,cpp}` | 3c.1, 3e.2, 3f.4, future 3d.2 (spatial index) |
+| `src/estimation.{h,cpp}` | 3b.2 |
+| `src/main.cpp` | all phases |
+| `tools/generate_catalog.py` | 3c.1, 3e.1, possibly future re-extension to Vmag 7.5 |
+| `tools/test_real_images.py` | 3a.5, post-3a.6 simplification |
+| `tools/monte_carlo.py` | Phase 2.4, 3e.5 (hit-rate instrumentation) |
+| `tools/benchmark.py` | 3c.2 |
+| NEW: `src/tiff_reader.{h,cpp}` | 3a.6 (during Pi window) |
+| NEW: `src/tracking.{h,cpp}` | 3d.1 |
+| NEW: `tools/calibrate_camera.py` | Pi window |
 
-### Parallelization
+---
 
-- 3b.1 (Gaussian centroiding) and 3b.2 (QUEST) can be done in parallel
-- 3c.1 (k-vector) can be done in parallel with 3b
-- 3e.1 (pattern catalog) and 3e.2 (C++ hash loader) can be done in
-  parallel against an agreed binary format; 3e.3 (identify_stars rewrite)
-  must wait on both
-- 3f.1, 3f.2, 3f.3 are file-independent and parallelizable
-
-### Overall Sequence (current → future)
+## Sequence Snapshot
 
 ```
-[done]  3a → 3b → 3c
-[next]  3e        (pattern hashing — algorithmic leap, pre-Pi)
-[then]  Pi bring-up + 3a.6  (hardware + 16-bit input)
-[then]  3f        (SIMD + cache + mmap, measured on Pi)
-[later] 3d        (EKF tracking, naturally post-Pi)
+[done]   1 → 2 → 3a → 3b → 3c → 3e → 3e.5 + 3f.4 polish
+[next]   Pi 4 bring-up + 3a.6 (16-bit TIFF) + camera calibration
+[then]   3f (SIMD + remaining cache work, measured on Pi)
+[later]  3d (EKF tracking — needs frame stream from Pi capture loop)
 ```

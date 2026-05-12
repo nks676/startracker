@@ -199,7 +199,8 @@ def main():
     os.makedirs(os.path.dirname(csv_out), exist_ok=True)
     with open(csv_out, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["trial", "truth_quat", "est_quat",
-                                                "angular_error_deg", "stars_identified", "status"])
+                                                "angular_error_deg", "stars_identified",
+                                                "pattern_path_hit", "status"])
         writer.writeheader()
         writer.writerows(results)
     print(f"\nResults saved to {csv_out}")
