@@ -591,11 +591,32 @@ or two additional observed stars, return on first acceptance.
 
 #### Phase 3e Checklist
 
-- [ ] 3e.1: Pattern catalog generation (multi-FOV bins)
-- [ ] 3e.2: Hash table loader + query in C++
-- [ ] 3e.3: identify_stars rewrite (pattern lookup + verify, pyramid fallback)
-- [ ] 3e.4: Tests + benchmark gate (<100ms desktop on both real fixtures)
-- [ ] Monte Carlo ≥ 95%, per-trial threshold tightened to 0.1°
+- [x] 3e.1: Pattern catalog generation — 3 FOV bins (10°, 15°, 20°),
+      ~870k patterns per bin, ~21 MB each. Wall-clock ~9 s per bin.
+- [x] 3e.2: C++ hash loader + `find_pattern` / `find_pattern_tolerant`.
+- [x] 3e.3: identify_stars rewrite — pattern lookup + 5th-star verify,
+      pyramid kept as named fallback (`identify_stars_pyramid`).
+- [x] 3e.4: Tests + benchmark — **identify stage met its target**
+      (alt60: 18,572 ms → 1.94 ms; alt40: 5,377 ms → 0.4 ms). The
+      <100ms-total gate is **not** met because `catalog_load` reads
+      99 MB of pair data at ~360 ms; that's Phase 3f.4 (mmap+mlock).
+- [x] Monte Carlo ≥ 95% — actually 100% (median 0.0041°, max 0.0197°).
+- Real-image regression: alt40 0.0000°, alt60 0.1074° (well under 0.5°).
+
+**Known follow-ups (deferred from 3e):**
+
+- **Pattern-path hit rate on Monte Carlo is ~20%**; the other 80% fall
+  back to pyramid. Root cause: canonical-order key generation sorts the
+  6 inter-star angles, so centroid noise that flips two near-equal
+  angle ranks shifts the key to a non-adjacent bucket, where ±1
+  tolerant probing cannot find it. Real images (well-separated star
+  geometry) hit the pattern path 100%; synthetic-with-noise hits 20%.
+- **Fix path:** mirror tetra3's choice — at query time, compute the key
+  for all 24 star-permutations and probe each, instead of relying on
+  one canonical ordering. 24× lookups still well within the µs budget.
+  Bundle into Phase 3f or as a 3e.5 patch.
+- **Catalog load is now the dominant cost** (~360 ms / 99 MB pair file).
+  Phase 3f.4 (mmap + mlock + prefault) is explicitly targeted at this.
 
 ---
 
