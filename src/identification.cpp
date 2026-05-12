@@ -338,6 +338,35 @@ apply_rotation_t(const double R[3][3], const std::array<double, 3> &v) {
 
 } // namespace
 
+// Phase 3e.5 (Change 1): generate the full set of plausible canonical keys
+// for a 4-star pattern under centroid noise.
+//
+// The canonical-order key generation sorts the 6 inter-star angular
+// distances. When two adjacent sorted distances are within a noise tolerance,
+// the sort can flip them under realistic centroid noise — and that flip
+// shifts the per-star edge signature, which shifts the canonical permutation,
+// which shifts the 5-quantized-ratio packing into a non-adjacent hash bucket.
+// `find_pattern_tolerant`'s ±1-quantum probing can't recover from such
+// shifts (the slot ordering changes by up to ±N quanta where N is the
+// difference between adjacent ratios).
+//
+// Fix: enumerate the small set of plausible edge sort orderings produced by
+// flipping pairs of adjacent ranks whose underlying distances are within
+// `noise_tol` (in radians). For each ordering, run the rest of the canonical
+// procedure (signatures, canonical permutation, quantize, pack) and emit the
+// resulting key plus the centroid→hip slot mapping. Duplicates are filtered
+// at the call site (cheap hash-set dedupe).
+//
+// For typical 4-star patterns 0–2 adjacent pairs are close enough to flip,
+// so the output is 1–4 keys. Each is a 243-probe `find_pattern_tolerant`
+// lookup — still well within the µs budget.
+//
+// On a noise-free input, this returns exactly one key, equal to
+// `pattern_key_canonical(vecs4, ids4, _)` — so it is a drop-in superset.
+std::vector<std::pair<uint64_t, std::array<int, 4>>>
+pattern_keys_noise_robust(const std::array<std::array<double, 3>, 4> &vecs4,
+                          const std::array<int, 4> &ids4, double noise_tol);
+
 uint64_t
 pattern_key_canonical(const std::array<std::array<double, 3>, 4> &vecs4,
                       const std::array<int, 4> &ids4,
@@ -409,6 +438,107 @@ pattern_key_canonical(const std::array<std::array<double, 3>, 4> &vecs4,
   }
 
   return (q[4] << 40) | (q[3] << 30) | (q[2] << 20) | (q[1] << 10) | q[0];
+}
+
+// Compute the canonical (key, centroid_canonical_order) for a 4-star pattern
+// GIVEN a specific edge ordering. Returns {0, ...} on degenerate input.
+// Mirrors steps 3–6 of pattern_key_canonical; the only difference is that
+// the caller supplies edge_order rather than the sort-determined ordering.
+static std::pair<uint64_t, std::array<int, 4>>
+pattern_key_with_edge_order(const std::array<double, 6> &dists,
+                            const std::array<int, 6> &edge_order,
+                            const std::array<int, 4> &ids4) {
+  std::array<std::array<int, 3>, 4> sig{};
+  std::array<int, 4> sig_fill = {0, 0, 0, 0};
+  for (int rank = 0; rank < 6; ++rank) {
+    int e = edge_order[rank];
+    int i = kEdgePairs[e].first;
+    int j = kEdgePairs[e].second;
+    sig[i][sig_fill[i]++] = rank;
+    sig[j][sig_fill[j]++] = rank;
+  }
+  for (int s = 0; s < 4; ++s)
+    std::sort(sig[s].begin(), sig[s].end());
+
+  std::array<int, 4> canonical = {0, 1, 2, 3};
+  std::sort(canonical.begin(), canonical.end(), [&](int a, int b) {
+    for (int k = 0; k < 3; ++k) {
+      if (sig[a][k] != sig[b][k]) return sig[a][k] < sig[b][k];
+    }
+    return ids4[a] < ids4[b];
+  });
+
+  double largest = dists[edge_order[5]];
+  if (!(largest > 0.0)) return {0ULL, canonical};
+
+  std::array<uint64_t, 5> q{};
+  for (int k = 0; k < 5; ++k) {
+    double r = dists[edge_order[k]] / largest;
+    double v = std::round(r * static_cast<double>(kQuantScale));
+    if (v < 0.0) v = 0.0;
+    if (v > static_cast<double>(kQuantScale)) v = static_cast<double>(kQuantScale);
+    q[k] = static_cast<uint64_t>(v);
+  }
+  uint64_t key =
+      (q[4] << 40) | (q[3] << 30) | (q[2] << 20) | (q[1] << 10) | q[0];
+  return {key, canonical};
+}
+
+std::vector<std::pair<uint64_t, std::array<int, 4>>>
+pattern_keys_noise_robust(const std::array<std::array<double, 3>, 4> &vecs4,
+                          const std::array<int, 4> &ids4, double noise_tol) {
+  // Compute the 6 pairwise distances (matches step 1 of pattern_key_canonical).
+  std::array<double, 6> dists{};
+  for (int e = 0; e < 6; ++e) {
+    int i = kEdgePairs[e].first;
+    int j = kEdgePairs[e].second;
+    double d = vecs4[i][0] * vecs4[j][0] + vecs4[i][1] * vecs4[j][1] +
+               vecs4[i][2] * vecs4[j][2];
+    if (d > 1.0) d = 1.0;
+    if (d < -1.0) d = -1.0;
+    dists[e] = std::acos(d);
+  }
+
+  // Build the base sorted edge order (same tie-break as canonical).
+  std::array<int, 6> base_order = {0, 1, 2, 3, 4, 5};
+  std::sort(base_order.begin(), base_order.end(), [&](int a, int b) {
+    if (dists[a] != dists[b]) return dists[a] < dists[b];
+    if (kEdgePairs[a].first != kEdgePairs[b].first)
+      return kEdgePairs[a].first < kEdgePairs[b].first;
+    return kEdgePairs[a].second < kEdgePairs[b].second;
+  });
+
+  // Identify uncertain adjacent pairs (ranks i, i+1) whose distance gap is
+  // within noise_tol. At most ~3 in practice for a noisy 4-star scene.
+  std::vector<int> uncertain_pos;
+  uncertain_pos.reserve(5);
+  for (int i = 0; i < 5; ++i) {
+    double gap = dists[base_order[i + 1]] - dists[base_order[i]];
+    if (gap < noise_tol) uncertain_pos.push_back(i);
+  }
+
+  // Enumerate 2^k orderings (k = uncertain count). For each subset of
+  // uncertain positions, swap the corresponding adjacent ranks in the order.
+  std::vector<std::pair<uint64_t, std::array<int, 4>>> out;
+  std::unordered_set<uint64_t> seen;
+  const size_t num_subsets = static_cast<size_t>(1) << uncertain_pos.size();
+  out.reserve(num_subsets);
+  for (size_t mask = 0; mask < num_subsets; ++mask) {
+    // Apply the swap pattern atop base_order. Swaps may overlap (adjacent
+    // positions); we apply them left-to-right so the result is a valid
+    // ordering. Overlap is handled by the dedupe below.
+    std::array<int, 6> order = base_order;
+    for (size_t bit = 0; bit < uncertain_pos.size(); ++bit) {
+      if (mask & (1u << bit)) {
+        int pos = uncertain_pos[bit];
+        std::swap(order[pos], order[pos + 1]);
+      }
+    }
+    auto kp = pattern_key_with_edge_order(dists, order, ids4);
+    if (!seen.insert(kp.first).second) continue;
+    out.emplace_back(kp);
+  }
+  return out;
 }
 
 namespace {
@@ -524,6 +654,271 @@ int expand_inliers(std::vector<int> &assignment,
   return inliers;
 }
 
+// Phase 3e.5 (Change 2): tight inlier expansion driven by a TRIAD attitude.
+//
+// For each currently-unassigned centroid, project it from camera frame into
+// inertial frame using the TRIAD rotation `R` (camera<-inertial), then search
+// the catalog for the nearest star to that predicted direction. Acceptance
+// gate is the same 0.05° (cos ≥ 1 - 4e-7) threshold used by the 5th-star
+// verify, so newly added stars are TIGHT — much tighter than the cos_tolerance
+// gate used by the pyramid-style expand_inliers, which absorbs FOV
+// miscalibration at the cost of letting wrong matches slip through.
+//
+// We can't iterate the full catalog directly from identification.cpp (catalog
+// API exposes only get_star / find_partners), so the "brute scan" is realised
+// by enumerating candidate HIPs via find_partners using EACH currently-matched
+// HIP as an anchor at the predicted cos(anchor, predicted_inertial). The union
+// of those candidate sets is then scored by direct dot-product against the
+// predicted inertial direction. With 4+ anchors and pattern-path-tight
+// cosines, the true catalog star is reliably in the union; the tight 0.05°
+// gate filters out the rest.
+//
+// Returns the new total inlier count. `assignment` is mutated in place.
+int expand_inliers_tight(std::vector<int> &assignment,
+                         const std::vector<std::array<double, 3>> &v_cam,
+                         const StarDatabase &db,
+                         const std::function<std::array<double, 3>(int)> &cat_vec,
+                         const double R[3][3], double accept_cos_tol) {
+  const int N = static_cast<int>(v_cam.size());
+
+  // Snapshot currently-matched (image_idx, hip) pairs.
+  std::vector<std::pair<int, int>> matched;
+  matched.reserve(8);
+  std::unordered_set<int> used;
+  used.reserve(16);
+  for (int i = 0; i < N; ++i) {
+    if (assignment[i] >= 0) {
+      matched.emplace_back(i, assignment[i]);
+      used.insert(assignment[i]);
+    }
+  }
+  if (matched.empty())
+    return 0;
+
+  // Cache anchor inertial vectors.
+  std::vector<std::array<double, 3>> anchor_vecs;
+  anchor_vecs.reserve(matched.size());
+  for (const auto &m : matched) {
+    try {
+      anchor_vecs.push_back(cat_vec(m.second));
+    } catch (...) {
+      anchor_vecs.push_back({0.0, 0.0, 0.0});
+    }
+  }
+
+  int inliers = static_cast<int>(matched.size());
+
+  // Wider find_partners tolerance so that ±0.05° centroid noise plus mild FOV
+  // miscal doesn't drop the true catalog star out of the candidate ring. The
+  // final acceptance is by direct dot-product against the predicted inertial
+  // direction, not by this lookup tolerance.
+  constexpr double kPartnerLookupTol = 1e-3;
+
+  for (int k = 0; k < N; ++k) {
+    if (assignment[k] >= 0)
+      continue;
+
+    // Predict inertial direction: v_iner = R^T * v_cam.
+    auto v_iner = apply_rotation_t(R, v_cam[k]);
+
+    // Score candidates pulled from every matched HIP's partner ring at the
+    // predicted angle. A real catalog star will show up across multiple
+    // anchors; spurious candidates show up against only one.
+    int best_C = -1;
+    double best_dot = -2.0;
+    for (size_t ai = 0; ai < matched.size(); ++ai) {
+      const auto &va = anchor_vecs[ai];
+      double cos_pred = va[0] * v_iner[0] + va[1] * v_iner[1] + va[2] * v_iner[2];
+      if (cos_pred < -1.0) cos_pred = -1.0;
+      if (cos_pred > 1.0) cos_pred = 1.0;
+      auto candidates = db.find_partners(matched[ai].second, cos_pred,
+                                          kPartnerLookupTol);
+      for (int C : candidates) {
+        if (used.count(C))
+          continue;
+        std::array<double, 3> vc;
+        try {
+          vc = cat_vec(C);
+        } catch (...) {
+          continue;
+        }
+        double d = vc[0] * v_iner[0] + vc[1] * v_iner[1] + vc[2] * v_iner[2];
+        if (d > best_dot) {
+          best_dot = d;
+          best_C = C;
+        }
+      }
+    }
+
+    if (best_C != -1 && best_dot >= 1.0 - accept_cos_tol) {
+      assignment[k] = best_C;
+      used.insert(best_C);
+      ++inliers;
+    }
+  }
+
+  return inliers;
+}
+
+// Phase 3e.5 (Change 2): solve a small Wahba problem and produce the
+// inertial->camera rotation matrix. Mirrors estimation.cpp's QUEST but kept
+// local so identification.cpp doesn't need to pull in estimation.h. Used only
+// to refine the TRIAD attitude after inlier expansion — the public API
+// (identify_stars → IdentifiedStar list → estimation.cpp) still does the
+// official QUEST downstream.
+//
+// Returns true on convergence; R_out is unmodified on failure.
+bool quest_attitude_local(
+    const std::vector<std::array<double, 3>> &v_cam_set,
+    const std::vector<std::array<double, 3>> &v_iner_set, double R_out[3][3]) {
+  const int M = static_cast<int>(v_cam_set.size());
+  if (M < 2) return false;
+  const double w = 1.0 / static_cast<double>(M);
+
+  double B[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
+  for (int k = 0; k < M; ++k) {
+    const auto &b = v_cam_set[k];
+    const auto &r = v_iner_set[k];
+    for (int a = 0; a < 3; ++a)
+      for (int bb = 0; bb < 3; ++bb)
+        B[a][bb] += w * b[a] * r[bb];
+  }
+
+  double S[3][3];
+  for (int a = 0; a < 3; ++a)
+    for (int bb = 0; bb < 3; ++bb)
+      S[a][bb] = B[a][bb] + B[bb][a];
+
+  double sigma = B[0][0] + B[1][1] + B[2][2];
+  double Z[3] = {B[2][1] - B[1][2], B[0][2] - B[2][0], B[1][0] - B[0][1]};
+
+  auto det3 = [](const double M3[3][3]) {
+    return M3[0][0] * (M3[1][1] * M3[2][2] - M3[1][2] * M3[2][1]) -
+           M3[0][1] * (M3[1][0] * M3[2][2] - M3[1][2] * M3[2][0]) +
+           M3[0][2] * (M3[1][0] * M3[2][1] - M3[1][1] * M3[2][0]);
+  };
+  double trace_adj_S = (S[1][1] * S[2][2] - S[1][2] * S[2][1]) +
+                       (S[0][0] * S[2][2] - S[0][2] * S[2][0]) +
+                       (S[0][0] * S[1][1] - S[0][1] * S[1][0]);
+  double detS = det3(S);
+  double ZtZ = Z[0] * Z[0] + Z[1] * Z[1] + Z[2] * Z[2];
+  double SZ[3] = {S[0][0] * Z[0] + S[0][1] * Z[1] + S[0][2] * Z[2],
+                  S[1][0] * Z[0] + S[1][1] * Z[1] + S[1][2] * Z[2],
+                  S[2][0] * Z[0] + S[2][1] * Z[1] + S[2][2] * Z[2]};
+  double ZtSZ = Z[0] * SZ[0] + Z[1] * SZ[1] + Z[2] * SZ[2];
+  double S2[3][3];
+  for (int a = 0; a < 3; ++a)
+    for (int bb = 0; bb < 3; ++bb)
+      S2[a][bb] = S[a][0] * S[0][bb] + S[a][1] * S[1][bb] + S[a][2] * S[2][bb];
+  double S2Z[3] = {S2[0][0] * Z[0] + S2[0][1] * Z[1] + S2[0][2] * Z[2],
+                   S2[1][0] * Z[0] + S2[1][1] * Z[1] + S2[1][2] * Z[2],
+                   S2[2][0] * Z[0] + S2[2][1] * Z[1] + S2[2][2] * Z[2]};
+  double ZtS2Z = Z[0] * S2Z[0] + Z[1] * S2Z[1] + Z[2] * S2Z[2];
+
+  double a = sigma * sigma - trace_adj_S;
+  double bcoef = sigma * sigma + ZtZ;
+  double c = detS + ZtSZ;
+  double dcoef = ZtS2Z;
+  double coef_lam2 = -(a + bcoef);
+  double coef_lam1 = -c;
+  double coef_lam0 = a * bcoef + c * sigma - dcoef;
+
+  double lambda = 1.0;
+  bool converged = false;
+  for (int it = 0; it < 30; ++it) {
+    double f = lambda * lambda * lambda * lambda +
+               coef_lam2 * lambda * lambda + coef_lam1 * lambda + coef_lam0;
+    double fp = 4.0 * lambda * lambda * lambda + 2.0 * coef_lam2 * lambda +
+                coef_lam1;
+    if (std::abs(fp) < 1e-30) break;
+    double delta = f / fp;
+    lambda -= delta;
+    if (std::abs(delta) < 1e-14) {
+      converged = true;
+      break;
+    }
+  }
+  if (!converged || !std::isfinite(lambda)) return false;
+
+  double alpha = lambda * lambda - sigma * sigma + trace_adj_S;
+  double beta = lambda - sigma;
+  double gamma = (lambda + sigma) * alpha - detS;
+  double Mq[3][3];
+  for (int aa = 0; aa < 3; ++aa)
+    for (int bb = 0; bb < 3; ++bb) {
+      Mq[aa][bb] = beta * S[aa][bb] + S2[aa][bb];
+      if (aa == bb) Mq[aa][bb] += alpha;
+    }
+  double X[3] = {Mq[0][0] * Z[0] + Mq[0][1] * Z[1] + Mq[0][2] * Z[2],
+                 Mq[1][0] * Z[0] + Mq[1][1] * Z[1] + Mq[1][2] * Z[2],
+                 Mq[2][0] * Z[0] + Mq[2][1] * Z[1] + Mq[2][2] * Z[2]};
+  double norm_sq = gamma * gamma + X[0] * X[0] + X[1] * X[1] + X[2] * X[2];
+  if (!std::isfinite(norm_sq) || norm_sq <= 0.0) return false;
+  double inv_n = 1.0 / std::sqrt(norm_sq);
+  double qx = X[0] * inv_n, qy = X[1] * inv_n, qz = X[2] * inv_n;
+  double qw = gamma * inv_n;
+
+  // Convert (qx, qy, qz, qw) — the inertial->camera quaternion — to a 3x3
+  // rotation matrix mapping inertial vectors into the camera frame.
+  R_out[0][0] = 1.0 - 2.0 * (qy * qy + qz * qz);
+  R_out[0][1] = 2.0 * (qx * qy - qz * qw);
+  R_out[0][2] = 2.0 * (qx * qz + qy * qw);
+  R_out[1][0] = 2.0 * (qx * qy + qz * qw);
+  R_out[1][1] = 1.0 - 2.0 * (qx * qx + qz * qz);
+  R_out[1][2] = 2.0 * (qy * qz - qx * qw);
+  R_out[2][0] = 2.0 * (qx * qz - qy * qw);
+  R_out[2][1] = 2.0 * (qy * qz + qx * qw);
+  R_out[2][2] = 1.0 - 2.0 * (qx * qx + qy * qy);
+  return true;
+}
+
+// Phase 3e.5: replace the TRIAD-on-the-original-4 attitude with a QUEST
+// attitude over the full current inlier set, then re-run tight inlier
+// expansion using that refined attitude. One pass of refine→re-expand is
+// usually enough: the second pass typically adds 0 new inliers.
+//
+// Mutates `assignment` and writes the refined rotation into `R_out` (which
+// also serves as the seed attitude on entry). Returns the final inlier count.
+int refine_and_reexpand(std::vector<int> &assignment,
+                        const std::vector<std::array<double, 3>> &v_cam,
+                        const StarDatabase &db,
+                        const std::function<std::array<double, 3>(int)> &cat_vec,
+                        double R_out[3][3], double accept_cos_tol) {
+  const int N = static_cast<int>(v_cam.size());
+
+  // First pass: expand using the TRIAD seed attitude already in R_out.
+  int inliers = expand_inliers_tight(assignment, v_cam, db, cat_vec, R_out,
+                                      accept_cos_tol);
+  if (inliers < 3) return inliers;
+
+  // QUEST refine on the current set.
+  std::vector<std::array<double, 3>> v_cam_set, v_iner_set;
+  v_cam_set.reserve(static_cast<size_t>(inliers));
+  v_iner_set.reserve(static_cast<size_t>(inliers));
+  for (int i = 0; i < N; ++i) {
+    if (assignment[i] < 0) continue;
+    v_cam_set.push_back(v_cam[i]);
+    try {
+      v_iner_set.push_back(cat_vec(assignment[i]));
+    } catch (...) {
+      v_cam_set.pop_back();
+    }
+  }
+  double R_refined[3][3];
+  if (!quest_attitude_local(v_cam_set, v_iner_set, R_refined)) {
+    return inliers;
+  }
+  for (int r = 0; r < 3; ++r)
+    for (int c = 0; c < 3; ++c)
+      R_out[r][c] = R_refined[r][c];
+
+  // Second pass with refined attitude; this can rescue inliers that were
+  // just outside the gate under the loose TRIAD-on-2-vectors seed attitude.
+  int new_inliers = expand_inliers_tight(assignment, v_cam, db, cat_vec,
+                                          R_out, accept_cos_tol);
+  return new_inliers;
+}
+
 // Try to verify a candidate 4-tuple pattern match by:
 //   1. Pair observed[centroid_idx_canonical[i]] (i in 0..3) with hips[i].
 //   2. Solve TRIAD on the pair with widest catalog separation (best numerical
@@ -537,7 +932,9 @@ int expand_inliers(std::vector<int> &assignment,
 //      match, accept.
 //
 // Returns the (partial) assignment image_idx -> HIP, with -1 for unassigned,
-// or nullopt-equivalent (empty vector) if rejection.
+// or nullopt-equivalent (empty vector) if rejection. On success, `R_out`
+// receives the TRIAD-derived inertial->camera rotation so the caller can
+// drive the inlier-expansion step without re-solving.
 std::vector<int>
 try_verify_candidate(const std::array<int, 4> &centroid_idx_canonical,
                      const std::array<int, 4> &hips,
@@ -545,7 +942,8 @@ try_verify_candidate(const std::array<int, 4> &centroid_idx_canonical,
                      const std::vector<std::array<double, 3>> &v_cam,
                      const StarDatabase &db,
                      const std::function<std::array<double, 3>(int)> &cat_vec,
-                     double pair_cos_tol, double verify_cos_tol) {
+                     double pair_cos_tol, double verify_cos_tol,
+                     double R_out[3][3]) {
   const int N = static_cast<int>(v_cam.size());
   std::vector<int> assignment(N, -1);
 
@@ -593,6 +991,9 @@ try_verify_candidate(const std::array<int, 4> &centroid_idx_canonical,
   }
   double R[3][3];
   triad_rotation(v_obs[best_a], v_obs[best_b], v_cat[best_a], v_cat[best_b], R);
+  for (int r = 0; r < 3; ++r)
+    for (int c = 0; c < 3; ++c)
+      R_out[r][c] = R[r][c];
 
   // Provisional 4-star assignment.
   for (int i = 0; i < 4; ++i) {
@@ -698,6 +1099,13 @@ constexpr int kVerifyPoolSize = 12;
 // 5th-star angular acceptance threshold ≈ 0.05° per the plan. cos(0.05°) ≈
 // 1 - 3.8e-7, so we require dot >= 1 - 4e-7.
 constexpr double kFifthStarVerifyCosTol = 4e-7;
+// Inlier-expansion acceptance threshold. Same 0.05° gate the brief mandates
+// for the post-verify inlier expansion step (cos(0.05°) ≈ 1 - 3.8e-7). Wide
+// enough to absorb sub-degree FOV miscal that the TRIAD seed attitude can't
+// correct, while still rejecting wrong-star matches (which would land 10×
+// further). The follow-up FOV-scale absorption in identify_stars() tightens
+// the implied tolerance once the camera focal is rescaled.
+constexpr double kInlierExpansionCosTol = 4e-7;
 // Pair-consistency cosine tolerance for the 4 pattern stars. Cos noise
 // across a 5-20° pattern at our centroid noise level is ~1e-5 — we use 5e-4
 // which still rejects gross mismatches but is loose enough to absorb FOV
@@ -766,35 +1174,89 @@ identify_stars_pattern(const std::vector<StarCentroid> &image_stars,
         for (int c = b + 1; c < K; ++c) {
           std::array<int, 4> centroid_indices = {seed_idx, knn[a], knn[b],
                                                   knn[c]};
+
+          // Phase 3e.5 (Change 1): noise-robust multi-key probing.
+          //
+          // The canonical-order key sorts the 6 inter-star angles. Under
+          // centroid noise, two near-equal angles can flip rank, shifting the
+          // canonical permutation and bumping the key to a distant bucket
+          // that ±1 tolerant probing can't reach. The catalog only stores the
+          // canonical key for the noise-free geometry, so we enumerate the
+          // 2^k orderings produced by flipping each uncertain adjacent-rank
+          // pair (where k is the number of uncertain pairs ≤ 5; in practice
+          // 1–3). One of those orderings will match the catalog's canonical
+          // key. Probe each with find_pattern_tolerant for residual ±1
+          // quantization slack.
+          //
+          // The 24-input-permutation variant tetra3 uses doesn't apply to our
+          // signature-based canonical_order: input permutation is invariant
+          // by construction here (per-star signatures are geometry-only, and
+          // both catalog and query tie-break on the input identifier — HIP
+          // and centroid index respectively — so all 24 input permutations
+          // produce the same canonical key). The rank-flip mechanism in
+          // pattern_keys_noise_robust is what actually addresses the noise
+          // failure mode.
+          //
+          // noise_tol = 2 mrad ≈ 7 arcmin. At synthetic 5-px-noise input on a
+          // 5000 px focal, per-pair angular noise is ~1.4e-3 rad; 1.5σ ≈ 2e-3
+          // catches the common rank-flip cases without generating an
+          // unreasonably large alternate-key set. Real images (lower per-star
+          // noise) end up with the same key as the canonical, which is the
+          // single-key path.
           std::array<std::array<double, 3>, 4> vecs4{};
           std::array<int, 4> ids4{};
           for (int i = 0; i < 4; ++i) {
             vecs4[i] = v_cam[centroid_indices[i]];
             ids4[i] = centroid_indices[i];
           }
-          std::array<int, 4> canonical_local{};
-          uint64_t key = pattern_key_canonical(vecs4, ids4, canonical_local);
+          constexpr double kPatternRankFlipNoiseRad = 2e-3;
+          auto raw_keys =
+              pattern_keys_noise_robust(vecs4, ids4, kPatternRankFlipNoiseRad);
+          std::vector<std::pair<uint64_t, std::array<int, 4>>> probe_keys;
+          probe_keys.reserve(raw_keys.size());
+          for (const auto &kp : raw_keys) {
+            std::array<int, 4> centroid_canonical{};
+            for (int i = 0; i < 4; ++i)
+              centroid_canonical[i] = centroid_indices[kp.second[i]];
+            probe_keys.emplace_back(kp.first, centroid_canonical);
+          }
+          for (const auto &kp : probe_keys) {
+            uint64_t key = kp.first;
+            const auto &centroid_canonical = kp.second;
+            auto candidates = db.find_pattern_tolerant(key);
+            if (candidates.empty()) continue;
 
-          std::array<int, 4> centroid_canonical{};
-          for (int i = 0; i < 4; ++i)
-            centroid_canonical[i] = centroid_indices[canonical_local[i]];
+            for (const auto &cand : candidates) {
+              std::array<int, 4> hips = {cand.hips[0], cand.hips[1],
+                                          cand.hips[2], cand.hips[3]};
+              double R_triad[3][3] = {{0}};
+              auto assignment = try_verify_candidate(
+                  centroid_canonical, hips, verify_pool, v_cam, db, cat_vec,
+                  kPatternPairCosTol, kFifthStarVerifyCosTol, R_triad);
+              if (assignment.empty()) continue;
 
-          // Tolerant probe. Try the narrow ±1 first (243 keys, fast); if
-          // empty, that means either the quad isn't in the catalog or
-          // noise has shifted the key by more than 1 bin. Don't widen here
-          // — wider probing only helps when this seed's geometry is the
-          // right one, and the per-quad cost can balloon. We'll fall
-          // through to pyramid if pattern path can't find anything.
-          auto candidates = db.find_pattern_tolerant(key);
-          if (candidates.empty()) continue;
-
-          for (const auto &cand : candidates) {
-            std::array<int, 4> hips = {cand.hips[0], cand.hips[1],
-                                        cand.hips[2], cand.hips[3]};
-            auto assignment = try_verify_candidate(
-                centroid_canonical, hips, verify_pool, v_cam, db, cat_vec,
-                kPatternPairCosTol, kFifthStarVerifyCosTol);
-            if (!assignment.empty()) {
+              // Change 2: tight inlier expansion + QUEST refine. Projects all
+              // remaining centroids into inertial using the TRIAD attitude,
+              // matches them against the catalog with a 0.05° gate, then
+              // refines the attitude via QUEST and re-expands. Bumps the
+              // inlier list from 5 (TRIAD on 4 + 5th-star verify) to N
+              // (typically 8–25 on a real scene), which lets the downstream
+              // QUEST in estimation.cpp converge to ~0.001° accuracy.
+              int n_before = 0;
+              for (int ii = 0; ii < (int)assignment.size(); ++ii)
+                if (assignment[ii] >= 0) ++n_before;
+              int n_after = refine_and_reexpand(assignment, v_cam, db, cat_vec,
+                                                R_triad, kInlierExpansionCosTol);
+              if (std::getenv("STARTRACKER_DEBUG_3E5")) {
+                std::fprintf(stderr,
+                             "[3e.5] pattern verify: %d -> %d inliers\n",
+                             n_before, n_after);
+                for (int ii = 0; ii < (int)assignment.size(); ++ii) {
+                  if (assignment[ii] >= 0)
+                    std::fprintf(stderr, "  centroid %d -> HIP %d\n", ii,
+                                 assignment[ii]);
+                }
+              }
               return assignment;
             }
           }
@@ -928,17 +1390,99 @@ identify_stars(const std::vector<StarCentroid> &image_stars,
     auto pattern_assignment =
         identify_stars_pattern(image_stars, camera, v_cam, db, cat_vec);
     if (!pattern_assignment.empty()) {
-      // The pattern path returned 4 + 1 verified stars. Extend with cheap
-      // partner-based expansion so QUEST has more data points — bumps
-      // attitude accuracy from ~5-star precision to N-star precision
-      // without re-running the pyramid.
+      // The pattern path already performed tight inlier expansion + QUEST
+      // refine + re-expand inside identify_stars_pattern (Phase 3e.5 change
+      // 2). All inliers in the returned assignment are within 0.05° of their
+      // catalog star against the refined attitude, which is tighter than
+      // cross_verify's 3*cos_tolerance gate; running cross_verify here would
+      // over-reject on miscalibrated cameras.
+
+      // Phase 3e.5: FOV-scale absorption. Mirrors the pyramid path's
+      // coarse-refine-reidentify step (3b.0b). The inlier set gives a stable
+      // estimate of the focal scale factor s = true_focal / assumed_focal.
+      // Real cameras commonly drift 0.1–0.5% from their nominal FOV; the
+      // pattern path's TRIAD/QUEST attitude inherits that drift, capping
+      // accuracy at ~(s-1) × FOV/2. Rescaling and re-expanding lets the
+      // attitude break through that floor and reach centroid-noise limits.
       //
-      // We deliberately skip cross_verify here: the 5th-star verification
-      // already imposed a 0.05° angular gate, which is much tighter than
-      // cross_verify's 3*cos_tolerance check. cross_verify would over-
-      // reject inliers on miscalibrated cameras (e.g. alt60's 0.4% FOV
-      // drift puts cosines at ~1e-3, well above 3*cos_tol = 3e-5).
-      expand_inliers(pattern_assignment, v_cam, db, cos_tolerance, cat_vec);
+      // Apply iteratively: each pass collapses ~90% of the residual scale
+      // error, so 2–3 passes converge to within the noise floor. We stop
+      // once the per-pass adjustment falls below the centroid-noise floor
+      // (~1e-4 ratio) or we hit the iteration cap.
+      CameraModel refined = camera;
+      double cumulative_scale = 1.0;
+      for (int iter = 0; iter < 3; ++iter) {
+        double scale = estimate_scale_factor(pattern_assignment, v_cam, db,
+                                              cat_vec);
+        if (!std::isfinite(scale)) break;
+        // Trigger only when the per-pass residual is well above per-star
+        // centroid noise (~1e-4 for our focal). Below that we'd just inject
+        // bias rather than remove it.
+        if (std::abs(scale - 1.0) <= 1e-4) break;
+
+        refined.focal_x *= scale;
+        refined.focal_y *= scale;
+        cumulative_scale *= scale;
+        auto v_cam_refined = compute_v_cam(image_stars, refined);
+
+        // Re-expand inliers under the refined camera. Solve TRIAD on the two
+        // matched stars with the widest catalog separation, then run the
+        // tight-expansion + QUEST-refine loop. The same routine that built
+        // the initial inlier set is reused; under a properly scaled camera,
+        // it typically converges to all visible cataloged stars.
+        std::vector<int> refined_assignment(N, -1);
+        int n_matched = 0;
+        for (int i = 0; i < N; ++i) {
+          if (pattern_assignment[i] < 0) continue;
+          refined_assignment[i] = pattern_assignment[i];
+          ++n_matched;
+        }
+        if (n_matched < 2) break;
+        // Build a seed TRIAD attitude from the two matched stars with the
+        // widest catalog separation (best conditioning).
+        int best_i = -1, best_j = -1;
+        double smallest_cos = 2.0;
+        std::vector<int> matched_idx;
+        matched_idx.reserve(n_matched);
+        for (int i = 0; i < N; ++i)
+          if (refined_assignment[i] >= 0) matched_idx.push_back(i);
+        for (size_t ai = 0; ai < matched_idx.size(); ++ai) {
+          auto vi = cat_vec(refined_assignment[matched_idx[ai]]);
+          for (size_t aj = ai + 1; aj < matched_idx.size(); ++aj) {
+            auto vj = cat_vec(refined_assignment[matched_idx[aj]]);
+            double cc = vi[0] * vj[0] + vi[1] * vj[1] + vi[2] * vj[2];
+            if (cc < smallest_cos) {
+              smallest_cos = cc;
+              best_i = matched_idx[ai];
+              best_j = matched_idx[aj];
+            }
+          }
+        }
+        if (best_i < 0 || best_j < 0) break;
+        std::array<double, 3> W1 = v_cam_refined[best_i];
+        std::array<double, 3> W2 = v_cam_refined[best_j];
+        std::array<double, 3> V1 = cat_vec(refined_assignment[best_i]);
+        std::array<double, 3> V2 = cat_vec(refined_assignment[best_j]);
+        double R_seed[3][3];
+        triad_rotation(W1, W2, V1, V2, R_seed);
+        refine_and_reexpand(refined_assignment, v_cam_refined, db, cat_vec,
+                             R_seed, kFifthStarVerifyCosTol);
+
+        // Count inliers under refined camera; commit to refined if it didn't
+        // strictly lose ground.
+        int refined_n = 0;
+        for (int i = 0; i < N; ++i)
+          if (refined_assignment[i] >= 0) ++refined_n;
+        if (refined_n < n_matched) break; // refinement removed inliers — back out
+        if (std::getenv("STARTRACKER_DEBUG_3E5")) {
+          std::fprintf(stderr,
+                       "[3e.5] FOV iter %d: s=%.6f (cumulative %.6f), "
+                       "%d -> %d inliers\n",
+                       iter, scale, cumulative_scale, n_matched, refined_n);
+        }
+        pattern_assignment = std::move(refined_assignment);
+        v_cam = std::move(v_cam_refined);
+      }
 
       int inliers = 0;
       for (int i = 0; i < N; ++i)

@@ -40,8 +40,10 @@ def random_quaternion():
 
 def run_tracker(binary_path, image_path, catalog_stars, catalog_pairs, fov_deg):
     """
-    Run the C++ startracker binary and return (estimated_quat, stars_identified).
-    Returns (None, 0) on failure.
+    Run the C++ startracker binary and return (estimated_quat, stars_identified,
+    pattern_path_hit). pattern_path_hit is True if identification succeeded via
+    the pattern-hash path (no "pattern path failed" message on stderr) and
+    False if it fell back to pyramid. Returns (None, 0, False) on failure.
     """
     result = subprocess.run(
         [binary_path, image_path, catalog_stars, catalog_pairs, str(fov_deg)],
@@ -49,6 +51,7 @@ def run_tracker(binary_path, image_path, catalog_stars, catalog_pairs, fov_deg):
     )
 
     stdout = result.stdout
+    stderr = result.stderr
     est_quat = None
     stars_identified = 0
 
@@ -62,7 +65,11 @@ def run_tracker(binary_path, image_path, catalog_stars, catalog_pairs, fov_deg):
             except (IndexError, ValueError):
                 pass
 
-    return est_quat, stars_identified
+    # Phase 3e logs "pattern path failed → pyramid fallback" to stderr when the
+    # pattern-hash path can't find a match and we fall back to the pyramid.
+    pattern_path_hit = ("pattern path failed" not in stderr)
+
+    return est_quat, stars_identified, pattern_path_hit
 
 
 def angular_error_deg(q_truth, q_est):
@@ -119,7 +126,7 @@ def main():
             )
 
             image_path = os.path.join(tmpdir, "synthetic_starfield.png")
-            q_est, stars_identified = run_tracker(
+            q_est, stars_identified, pattern_hit = run_tracker(
                 binary_path, image_path, catalog_stars, catalog_pairs, args.fov
             )
 
@@ -138,12 +145,14 @@ def main():
                 "angular_error_deg": round(error_deg, 6) if error_deg is not None else None,
                 "stars_identified": stars_identified,
                 "status":           status,
+                "pattern_path_hit": pattern_hit,
             })
 
             marker = "." if status == "success" else "F"
+            path_tag = "P" if pattern_hit else "y"  # P=pattern, y=pyramid fallback
             print(f"  Trial {i+1:3d}/{args.num_trials}: "
                   f"{'%.4f°' % error_deg if error_deg is not None else 'NO SOLUTION':>10s}  "
-                  f"stars={stars_identified}  {marker}")
+                  f"stars={stars_identified}  [{path_tag}]{marker}")
 
     # --- Statistics ---
     successful = [r for r in results if r["status"] == "success"]
@@ -164,6 +173,20 @@ def main():
         print(f"  Mean   : {np.mean(errors):.4f}°")
         print(f"  95th % : {np.percentile(errors, 95):.4f}°")
         print(f"  Max    : {np.max(errors):.4f}°")
+
+    # Phase 3e pattern-path hit rate. Trials where stderr did NOT contain the
+    # "pattern path failed" message succeeded via the pattern-hash path; the
+    # rest fell back to the pyramid algorithm. Hit rate is a leading indicator
+    # of Phase 3e's contribution to overall performance.
+    pattern_hits = sum(1 for r in results if r.get("pattern_path_hit"))
+    pattern_attempted = sum(
+        1 for r in results
+        if r.get("est_quat") is not None or r.get("status") == "failed"
+    )
+    if pattern_attempted > 0:
+        rate = 100.0 * pattern_hits / pattern_attempted
+        print(f"\nPattern-path hit rate: {rate:.1f}%  "
+              f"({pattern_hits}/{pattern_attempted}; rest fell back to pyramid)")
 
     if failed:
         print(f"\nFailure cases ({len(failed)}):")
