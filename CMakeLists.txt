@@ -43,4 +43,12 @@ add_executable(startracker_tests
 target_link_libraries(startracker_tests PRIVATE startracker_core GTest::gtest_main)
 
 include(GoogleTest)
-gtest_discover_tests(startracker_tests)
+# DISCOVERY_MODE PRE_TEST: enumerate test cases when `ctest` runs rather than
+# at build time. POST_BUILD (the default) invokes the freshly-linked test
+# binary as a build step, which fails under cross-compile because the host
+# can't execute the aarch64 ELF — surfaces as
+# "GoogleTestAddTests: Unknown system error -8" with ENOEXEC. The host CI
+# lane sees no behavioural change (ctest still discovers + runs everything);
+# the build-arm64-cross lane now finishes the compile-and-link signal it
+# was meant to deliver. CMake documents PRE_TEST as the cross-compile fix.
+gtest_discover_tests(startracker_tests DISCOVERY_MODE PRE_TEST)
