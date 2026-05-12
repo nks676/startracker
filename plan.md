@@ -442,10 +442,16 @@ Post-processing step after voting: verify that angular distances between ALL pai
 
 #### Phase 3b Checklist
 
-- [ ] 3b.1: Gaussian centroiding
-- [ ] 3b.2: QUEST attitude estimator
-- [ ] 3b.3: Identification cross-verification
-- [ ] Monte Carlo success rate ≥ 90%, per-trial threshold tightened to 0.5°
+- [x] 3b.0a: Peak-intensity ranking; CENTROID_CAP raised from 25 → 50
+      (60 caused pyramid noise breakdown on dense real-image scenes)
+- [x] 3b.0b: Coarse-refine-reidentify FOV scaling; absorbs the 0.4% FOV
+      calibration drift on alt60 (no per-fixture cos_tol override)
+- [x] 3b.1: Gaussian centroiding
+- [x] 3b.2: QUEST attitude estimator (TRIAD fallback, 0 fallbacks in MC)
+- [x] 3b.3: Identification cross-verification
+- [x] Monte Carlo success rate ≥ 90% — actually 100%, median 0.0041°,
+      max 0.0147° (well under 0.5° per-trial threshold)
+- Real-image regression: alt40 0.0000°, alt60 0.0000°
 
 ---
 
@@ -470,9 +476,15 @@ Replace binary search in `find_pairs()` with Mortari's k-vector for O(1) lookup.
 
 #### Phase 3c Checklist
 
-- [ ] 3c.1: K-vector search
-- [ ] 3c.2: Benchmarking framework
-- [ ] Benchmark baseline established
+- [x] 3c.1: K-vector search (936922 bins, dq=1e-7; parity verified vs.
+      binary search over 1000 random queries)
+- [x] 3c.2: Benchmarking framework (`tools/benchmark.py`, `--benchmark`
+      flag on the binary)
+- [x] Benchmark baseline established (post-3b/3c, macOS Release):
+      alt40 identify=5.4s, alt60 identify=18.6s (median). Identify-stage
+      cost grew vs. W5's pre-merge baseline because CAP rose 25→50 and
+      W3's coarse-refine wrapper runs an extra pass on miscalibrated
+      cameras. RANSAC seeding (3b.0a option b) would cut this — deferred.
 
 ---
 
