@@ -228,49 +228,6 @@ std::vector<StarCentroid> extract_centroids_impl_t(const T *image, int width,
 
 } // namespace
 
-std::vector<uint8_t> subtract_background(const uint8_t *image, int width,
-                                         int height, int tile_size) {
-  if (tile_size < 1)
-    tile_size = 1;
-  int n_tx = tile_count(width, tile_size);
-  int n_ty = tile_count(height, tile_size);
-
-  // Per-tile median. nth_element is O(N) per tile; total cost O(W*H).
-  std::vector<uint8_t> bg_tiles(static_cast<size_t>(n_tx) * n_ty, 0);
-  std::vector<uint8_t> buf;
-  buf.reserve(static_cast<size_t>(tile_size) * tile_size);
-  for (int ty = 0; ty < n_ty; ++ty) {
-    int y0 = ty * tile_size;
-    int y1 = std::min(y0 + tile_size, height);
-    for (int tx = 0; tx < n_tx; ++tx) {
-      int x0 = tx * tile_size;
-      int x1 = std::min(x0 + tile_size, width);
-      buf.clear();
-      for (int y = y0; y < y1; ++y) {
-        const uint8_t *row = image + y * width;
-        buf.insert(buf.end(), row + x0, row + x1);
-      }
-      if (buf.empty())
-        continue;
-      auto mid = buf.begin() + buf.size() / 2;
-      std::nth_element(buf.begin(), mid, buf.end());
-      bg_tiles[ty * n_tx + tx] = *mid;
-    }
-  }
-
-  std::vector<uint8_t> out(static_cast<size_t>(width) * height, 0);
-  for (int y = 0; y < height; ++y) {
-    for (int x = 0; x < width; ++x) {
-      double bg = bilinear_sample(bg_tiles, n_tx, n_ty, tile_size, width,
-                                  height, x, y);
-      int v = static_cast<int>(image[y * width + x]) -
-              static_cast<int>(std::lround(bg));
-      out[y * width + x] = static_cast<uint8_t>(std::clamp(v, 0, 255));
-    }
-  }
-  return out;
-}
-
 namespace {
 
 // Build the per-pixel adaptive threshold buffer used by both the CoG and

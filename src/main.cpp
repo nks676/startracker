@@ -16,16 +16,25 @@
 #include "tiff_reader.h"
 
 int main(int argc, char **argv) {
-  // Peel off the optional `--benchmark` flag from any positional slot before
-  // the legacy positional argv counting kicks in. Keeps default output byte-
-  // identical when the flag is absent.
+  // Peel off the optional `--benchmark` / `--stats` flags from any positional
+  // slot before the legacy positional argv counting kicks in. Default output
+  // is byte-identical when neither flag is set.
+  //
+  // Phase 3g.3: `--stats` requests internal pipeline counters (pattern hit
+  // rate, seeds tried, fallback flag, inlier count, FOV-scale iters). Cheap
+  // to enable and harmless in production; useful for triaging Pi captures
+  // where success/fail rate alone hides the underlying behaviour.
   bool benchmark = false;
+  bool emit_stats = false;
   {
     std::vector<char *> filtered;
     filtered.reserve(argc);
     for (int i = 0; i < argc; ++i) {
-      if (std::string(argv[i]) == "--benchmark") {
+      std::string arg(argv[i]);
+      if (arg == "--benchmark") {
         benchmark = true;
+      } else if (arg == "--stats") {
+        emit_stats = true;
       } else {
         filtered.push_back(argv[i]);
       }
@@ -127,13 +136,26 @@ int main(int argc, char **argv) {
   // Rank by peak (max pixel value in the component) rather than intensity
   // (sum): 8-bit saturated blobs inflate sum but cap peak at 255, so peak
   // gives a more honest brightness ordering when stars saturate.
+  //
+  // Phase 3g.9: secondary tie-breaks (intensity desc, then y asc, x asc) make
+  // the seed-pool ordering deterministic. 8-bit inputs commonly produce ties
+  // at peak=255 (saturation); 16-bit inputs tie less often but can still tie
+  // at sensor saturation or at 0. Without the tie-break, identical inputs
+  // could route through different pattern-path seeds based on `partial_sort`'s
+  // unspecified equal-key ordering — the alt60 35 ms vs 5 ms identify-stage
+  // variance traced back to this. `identification.cpp::top_n_indices` mirrors
+  // this exact comparator so the seed pool inside identify_stars stays in
+  // lock-step with main.cpp's pre-trim.
   constexpr size_t CENTROID_CAP = 50;
+  auto centroid_rank_better = [](const StarCentroid &a, const StarCentroid &b) {
+    if (a.peak != b.peak) return a.peak > b.peak;
+    if (a.intensity != b.intensity) return a.intensity > b.intensity;
+    if (a.y != b.y) return a.y < b.y;
+    return a.x < b.x;
+  };
   if (centroids.size() > CENTROID_CAP) {
     std::partial_sort(centroids.begin(), centroids.begin() + CENTROID_CAP,
-                      centroids.end(),
-                      [](const StarCentroid &a, const StarCentroid &b) {
-                        return a.peak > b.peak;
-                      });
+                      centroids.end(), centroid_rank_better);
     centroids.resize(CENTROID_CAP);
     std::cout << "Kept top " << CENTROID_CAP << " by peak intensity.\n";
   }
@@ -187,7 +209,10 @@ int main(int argc, char **argv) {
   camera.p2 = p2;
 
   auto t_identify_start = clk::now();
-  auto identified = identify_stars(centroids, camera, db, cos_tol);
+  IdentifyStats stats;
+  auto identified =
+      identify_stars(centroids, camera, db, cos_tol,
+                     emit_stats ? &stats : nullptr);
   auto t_identify_end = clk::now();
   std::cout << "Identified " << identified.size() << " stars.\n";
   if (benchmark) {
@@ -195,6 +220,19 @@ int main(int argc, char **argv) {
                   t_identify_end - t_identify_start)
                   .count();
     std::cout << "[bench] stage=identify us=" << us << "\n";
+  }
+  if (emit_stats) {
+    // One line, key=value pairs separated by spaces — greppable from
+    // monte_carlo.py / benchmark.py without invasive output-schema changes.
+    std::cout << "[stats]"
+              << " pattern_catalog_loaded="
+              << (stats.pattern_catalog_loaded ? 1 : 0)
+              << " pattern_seeds_tried=" << stats.pattern_seeds_tried
+              << " pattern_path_hit=" << (stats.pattern_path_hit ? 1 : 0)
+              << " fallback_to_pyramid="
+              << (stats.fallback_to_pyramid ? 1 : 0)
+              << " fov_scale_iters=" << stats.fov_scale_iters
+              << " final_inliers=" << stats.final_inliers << "\n";
   }
 
   if (identified.size() < 2) {

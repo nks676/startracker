@@ -23,13 +23,6 @@ struct CentroidFilterParams {
   int border_margin = 5;    // bbox must be this far from any edge
 };
 
-// Subtracts a tile-based median background estimate from an 8-bit image.
-// Returns a new buffer with same dimensions. Pixels are clamped to [0,255].
-// tile_size: side length of each tile (default 64). Background between tiles
-// is bilinearly interpolated from per-tile medians.
-std::vector<uint8_t> subtract_background(const uint8_t *image, int width,
-                                         int height, int tile_size = 64);
-
 // Extracts centroids from an 8-bit grayscale image using global thresholding
 // and CoG. Also applies the shape/size filters in CentroidFilterParams.
 std::vector<StarCentroid>

@@ -11,6 +11,9 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_library(startracker_core STATIC
     src/image_processing.cpp
     src/catalog.cpp
+    src/camera_model.cpp
+    src/wahba.cpp
+    src/pattern_hash.cpp
     src/identification.cpp
     src/estimation.cpp
     src/tiff_reader.cpp

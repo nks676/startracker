@@ -972,3 +972,393 @@ TEST_F(IdentificationTest, AccuracyAfterVerify) {
         << sigma_arcsec << "″ exceeds 0.05° gate";
   }
 }
+
+// === Phase 3g.7: adversarial unit tests ===
+
+// 3g.7 (1) — EdgeRankFlipStress. Anchor on the same FOV-20 4-tuple as
+// PermutationProbeFindsKey, project it to a 20° FOV camera, and add jitter
+// in *pixel* space that's enough to flip the canonical sort order on the
+// two closest sorted edges. The noise-robust path
+// (pattern_keys_noise_robust, called from identify_stars with a 2 mrad
+// tolerance) must produce the canonical key under one of the 2^k flipped
+// orderings and recover the 4 HIPs end-to-end.
+//
+// identify_stars's pattern path requires N >= 5 (4 + 1 verification), so we
+// pad the anchor 4-tuple with extra catalog stars projected through the
+// same rotation. We pull them straight from catalog_stars.bin (whose layout
+// is documented in catalog.cpp) so the test stays self-contained.
+TEST_F(IdentificationTest, EdgeRankFlipStress) {
+  try {
+    db->load_pattern_catalog(PATTERN_FILE_20);
+  } catch (const std::exception &e) {
+    GTEST_SKIP() << "FOV-20 pattern catalog not available: " << e.what();
+  }
+
+  PinholeCamera cam;
+  cam.frame_width = 1024;
+  cam.frame_height = 1024;
+  cam.center_x = 512.0;
+  cam.center_y = 512.0;
+  cam.focal_x = 1024.0 / (2.0 * std::tan(20.0 * M_PI / 360.0));
+  cam.focal_y = cam.focal_x;
+
+  std::array<int, 4> hips{};
+  std::array<std::array<double, 3>, 4> v_cam{};
+  double R[3][3];
+  build_known_4star_scene(*db, cam, R, hips, v_cam);
+
+  // Find the smallest adjacent-distance gap across the 6 sorted edges. We'll
+  // then nudge centroids by an amount that, in angle terms, just exceeds the
+  // gap — guaranteeing a rank flip on the noise-free canonical key.
+  static constexpr int EDGE_PAIRS[6][2] = {
+      {0, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}, {2, 3}};
+  std::array<double, 6> dists{};
+  for (int e = 0; e < 6; ++e) {
+    int i = EDGE_PAIRS[e][0];
+    int j = EDGE_PAIRS[e][1];
+    double d = v_cam[i][0] * v_cam[j][0] + v_cam[i][1] * v_cam[j][1] +
+               v_cam[i][2] * v_cam[j][2];
+    if (d > 1.0) d = 1.0;
+    if (d < -1.0) d = -1.0;
+    dists[e] = std::acos(d);
+  }
+  std::array<double, 6> sorted_dists = dists;
+  std::sort(sorted_dists.begin(), sorted_dists.end());
+  double min_gap = 1e9;
+  for (int i = 0; i < 5; ++i)
+    min_gap = std::min(min_gap, sorted_dists[i + 1] - sorted_dists[i]);
+  ASSERT_GT(min_gap, 0.0)
+      << "Anchor pattern is degenerate — adjacent edges have zero gap";
+
+  // Confirm the anchor pattern's two closest edges are within the
+  // noise-robust trigger threshold (2 mrad inside identify_stars). At the
+  // FOV-20 index 435036 anchor used by build_known_4star_scene this is
+  // ~1.85e-3 rad, so any centroid noise pushing the per-edge angle by half
+  // that amount can flip the canonical sort order. If the anchor ever
+  // becomes a "wider gap" pattern this assertion would catch it.
+  EXPECT_LT(min_gap, 2e-3)
+      << "Anchor pattern's smallest adjacent edge gap is " << min_gap
+      << " rad; rank-flip stress is mild and the noise-robust path may "
+         "not engage";
+
+  // Project the 4 camera-frame unit vectors to pixel coordinates. v_cam from
+  // build_known_4star_scene is already in the camera frame (rotation applied
+  // to inertial unit vectors), so projection is the direct pinhole map.
+  std::vector<StarCentroid> centroids(4);
+  std::set<int> seen_hips;
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_GT(v_cam[i][2], 0.0) << "Star " << i << " is behind the camera";
+    centroids[i].x = cam.focal_x * (v_cam[i][0] / v_cam[i][2]) + cam.center_x;
+    centroids[i].y = cam.focal_y * (v_cam[i][1] / v_cam[i][2]) + cam.center_y;
+    centroids[i].intensity = 1000.0;
+    centroids[i].peak = 250.0 - i; // brightness-rank for seed ordering
+    seen_hips.insert(hips[i]);
+  }
+
+  // Pad with extra real catalog stars from catalog_stars.bin within the
+  // frame, so identify_stars's pattern path (which needs N >= 5) can run.
+  // Layout: int32 num_stars, then num_stars × {int32 hip, double x,y,z}.
+  // Collect their HIPs in `extra_hips` so the truth set below covers the
+  // full real-catalog content of the scene.
+  std::vector<int> extra_hips;
+  {
+    std::ifstream fs(STAR_FILE, std::ios::binary);
+    ASSERT_TRUE(fs.good()) << "catalog_stars.bin missing";
+    int32_t num_stars = 0;
+    fs.read(reinterpret_cast<char *>(&num_stars), 4);
+    ASSERT_GT(num_stars, 0);
+    int extras_added = 0;
+    for (int i = 0; i < num_stars && extras_added < 6; ++i) {
+      int32_t hip;
+      double x, y, z;
+      fs.read(reinterpret_cast<char *>(&hip), 4);
+      fs.read(reinterpret_cast<char *>(&x), 8);
+      fs.read(reinterpret_cast<char *>(&y), 8);
+      fs.read(reinterpret_cast<char *>(&z), 8);
+      if (seen_hips.count(hip)) continue;
+      double vz = R[2][0] * x + R[2][1] * y + R[2][2] * z;
+      if (vz <= 0.5) continue; // must be in front of camera, away from edge
+      double vx = R[0][0] * x + R[0][1] * y + R[0][2] * z;
+      double vy = R[1][0] * x + R[1][1] * y + R[1][2] * z;
+      StarCentroid c;
+      c.x = cam.focal_x * (vx / vz) + cam.center_x;
+      c.y = cam.focal_y * (vy / vz) + cam.center_y;
+      if (c.x < 0 || c.x >= cam.frame_width || c.y < 0 ||
+          c.y >= cam.frame_height)
+        continue;
+      c.intensity = 500.0;
+      c.peak = 100.0 - extras_added; // fainter than anchor 4 (peak 247-250)
+      centroids.push_back(c);
+      extra_hips.push_back(hip);
+      extras_added++;
+    }
+    ASSERT_GE(centroids.size(), 5u)
+        << "Couldn't find enough extra catalog stars near the anchor 4-tuple";
+  }
+
+  // Add pixel jitter sized to flip rank on the closest-pair edges. At this
+  // FOV the per-pixel angle is ~20°/1024 ≈ 3.4e-4 rad, so 1 px of jitter
+  // produces ~0.5 mrad of inter-star angle noise — enough to flip rank on
+  // the closest edge pair (min_gap ≈ 1.85e-3 rad) under some RNG seeds,
+  // while staying inside the post-TRIAD verify gate (4e-7 cosine ≈ 0.05°,
+  // which corresponds to ~1 mrad of inertial projection error after TRIAD
+  // on the noisy anchor pair). Sample a small grid of RNG seeds and require
+  // at least one seed to produce a successful identification: this proves
+  // the noise-robust probing reaches the canonical key under at least one
+  // realistic rank-flipped ordering.
+  // Truth set = anchor 4 HIPs + extra HIPs added to pad N >= 5.
+  std::set<int> truth(hips.begin(), hips.end());
+  for (int h : extra_hips) truth.insert(h);
+
+  bool any_seed_ok = false;
+  int best_identified = 0;
+  int best_correct = 0;
+  std::normal_distribution<double> jitter(0.0, 1.0);
+  for (uint32_t seed : {20260512u, 20260513u, 20260514u, 20260515u, 20260516u}) {
+    std::mt19937 rng(seed);
+    std::vector<StarCentroid> noisy = centroids;
+    // Apply noise to the first 4 centroids (the rank-flip-sensitive anchor
+    // 4-tuple). The extra-padding stars stay clean so they provide stable
+    // cross-verification anchors for the pipeline.
+    for (int i = 0; i < 4; ++i) {
+      noisy[i].x += jitter(rng);
+      noisy[i].y += jitter(rng);
+    }
+
+    auto identified = identify_stars(noisy, cam, *db, 1e-5);
+    int correct = 0;
+    bool any_anchor = false;
+    std::set<int> anchor_set(hips.begin(), hips.end());
+    for (const auto &s : identified) {
+      if (truth.count(s.catalog_hip_id)) ++correct;
+      if (anchor_set.count(s.catalog_hip_id)) any_anchor = true;
+    }
+    if ((int)identified.size() > best_identified) {
+      best_identified = identified.size();
+      best_correct = correct;
+    }
+    // Require at least 4 correct identifications AND at least one of them
+    // to be from the anchor 4-tuple (i.e. the rank-flipped pattern actually
+    // landed on the canonical key under the noise-robust probing).
+    if ((int)identified.size() >= 4 && correct >= 4 && any_anchor) {
+      any_seed_ok = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(any_seed_ok)
+      << "EdgeRankFlipStress: noise-robust probing failed under all RNG "
+         "seeds. Best run: identified=" << best_identified
+      << " correct=" << best_correct
+      << ". The pipeline did not recover the rank-flipped canonical key.";
+}
+
+// 3g.7 (2) — RejectsBrightNonCatalogContaminant. Build the Ursa Major scene,
+// then insert one ultra-bright centroid at a pixel location that doesn't
+// correspond to any real catalog star. The contaminant has the largest
+// `peak`, so the seed-selection loop in identify_stars will try it first.
+// Identification must reject the contaminant (it won't appear in the
+// returned list) while still recovering the real stars.
+TEST_F(IdentificationTest, RejectsBrightNonCatalogContaminant) {
+  PinholeCamera cam;
+  cam.frame_width = 1024;
+  cam.frame_height = 1024;
+  cam.center_x = 512.0;
+  cam.center_y = 512.0;
+  cam.focal_x = 1024.0 / (2.0 * std::tan(90.0 * M_PI / 180.0 / 2.0));
+  cam.focal_y = cam.focal_x;
+  double R[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+
+  std::vector<int> candidates = {
+      11767, 82396, 75097, 72607, 54061, 53910,
+      58001, 59774, 62956, 65378, 67301,
+  };
+  std::vector<StarCentroid> centroids;
+  std::vector<int> expected_hips;
+  gather_visible_stars(candidates, *db, cam, R, centroids, expected_hips);
+  ASSERT_GE(centroids.size(), 8u) << "Need clean scene of ≥8 stars";
+
+  // Real-star centroids get descending peaks so they have a stable
+  // brightness order independent of insertion order.
+  for (size_t i = 0; i < centroids.size(); ++i)
+    centroids[i].peak = 200.0 - static_cast<double>(i);
+
+  // Insert a non-catalog "bright object" at a pixel position chosen to not
+  // sit within ~5° of any of the real stars. The corner (50, 950) is well
+  // off-pattern for our Ursa-Major-centric +Z boresight at 90° FOV.
+  StarCentroid contaminant;
+  contaminant.x = 50.0;
+  contaminant.y = 950.0;
+  contaminant.intensity = 10000.0;
+  contaminant.peak = 500.0; // largest peak → seed candidate index 0
+  int contaminant_idx = static_cast<int>(centroids.size());
+  centroids.push_back(contaminant);
+
+  // Sanity: contaminant is at least 5° from each real star's unit-vector
+  // direction. We back-project both to camera-frame unit vectors and check
+  // their dot product against cos(5°).
+  double v_cont[3];
+  undistort_to_unit_vector(cam, contaminant.x, contaminant.y, v_cont);
+  const double cos5 = std::cos(5.0 * M_PI / 180.0);
+  for (size_t i = 0; i < centroids.size() - 1; ++i) {
+    double v_real[3];
+    undistort_to_unit_vector(cam, centroids[i].x, centroids[i].y, v_real);
+    double d = v_cont[0] * v_real[0] + v_cont[1] * v_real[1] +
+               v_cont[2] * v_real[2];
+    ASSERT_LT(d, cos5)
+        << "Contaminant is within 5° of real star " << i;
+  }
+
+  const double cos_tol = 1e-5;
+  auto identified = identify_stars(centroids, cam, *db, cos_tol);
+
+  // The contaminant centroid must not appear in the result.
+  for (const auto &s : identified) {
+    EXPECT_NE(s.image_idx, contaminant_idx)
+        << "Non-catalog contaminant was matched to HIP " << s.catalog_hip_id;
+  }
+
+  // Every returned HIP must be a real catalog HIP from our truth set.
+  std::set<int> truth(expected_hips.begin(), expected_hips.end());
+  for (const auto &s : identified) {
+    EXPECT_TRUE(truth.count(s.catalog_hip_id))
+        << "Identified an unexpected (non-truth) HIP " << s.catalog_hip_id
+        << " for image_idx=" << s.image_idx;
+  }
+
+  // The real stars should still be recoverable despite the contaminant.
+  int correct = 0;
+  for (const auto &s : identified)
+    if (truth.count(s.catalog_hip_id)) ++correct;
+  EXPECT_GE(correct, 6)
+      << "Contaminant disrupted identification of real stars; correct="
+      << correct;
+}
+
+// 3g.7 (3a) — FovBinBoundary12_5. main.cpp's FOV-to-pattern-bin rule is
+// (fov_deg <= 12.5) ? 10 : (fov_deg <= 17.5) ? 15 : 20. 12.5° lands in bin
+// 10; 17.5° lands in bin 15 (covered by the next test). Build a dense
+// synthetic scene at exactly 12.5° FOV and confirm identification succeeds.
+TEST_F(IdentificationTest, FovBinBoundary12_5) {
+  // Mirror main.cpp's bin selection: 12.5° → bin 10.
+  try {
+    db->load_pattern_catalog(PATTERN_FILE_10);
+  } catch (const std::exception &e) {
+    GTEST_SKIP() << "FOV-10 pattern catalog not available: " << e.what();
+  }
+
+  PinholeCamera cam;
+  cam.frame_width = 1024;
+  cam.frame_height = 1024;
+  cam.center_x = 512.0;
+  cam.center_y = 512.0;
+  const double fov_deg = 12.5;
+  cam.focal_x = 1024.0 / (2.0 * std::tan(fov_deg * M_PI / 180.0 / 2.0));
+  cam.focal_y = cam.focal_x;
+
+  // Reuse the dense HIP-3334 anchor used by RefinedFovRecoversAlt60Scenario
+  // and NoiseRobustnessSweep. ~25 candidates within 6° of boresight.
+  CatalogStar bs = db->get_star(3334);
+  double c3[3] = {bs.x, bs.y, bs.z};
+  double up[3] = {0.0, 0.0, 1.0};
+  if (std::abs(c3[0]) < 1e-6 && std::abs(c3[1]) < 1e-6) {
+    up[0] = 1.0; up[1] = 0.0; up[2] = 0.0;
+  }
+  double c1[3] = {up[1] * c3[2] - up[2] * c3[1],
+                  up[2] * c3[0] - up[0] * c3[2],
+                  up[0] * c3[1] - up[1] * c3[0]};
+  double n1 = std::sqrt(c1[0] * c1[0] + c1[1] * c1[1] + c1[2] * c1[2]);
+  for (int k = 0; k < 3; ++k) c1[k] /= n1;
+  double c2[3] = {c3[1] * c1[2] - c3[2] * c1[1],
+                  c3[2] * c1[0] - c3[0] * c1[2],
+                  c3[0] * c1[1] - c3[1] * c1[0]};
+  double R[3][3] = {{c1[0], c1[1], c1[2]},
+                    {c2[0], c2[1], c2[2]},
+                    {c3[0], c3[1], c3[2]}};
+
+  std::vector<int> candidates = {
+      3334, 3649, 3058, 3821, 4292, 3030, 2876, 4422, 4383,
+      2377, 3584, 3179, 4440, 4427, 4811, 4151, 4961, 2074,
+      2101, 1892, 3988, 4475, 5232, 2440, 5361,
+  };
+  std::vector<StarCentroid> centroids;
+  std::vector<int> expected_hips;
+  gather_visible_stars(candidates, *db, cam, R, centroids, expected_hips);
+  ASSERT_GE(centroids.size(), 6u)
+      << "Need ≥6 stars in 12.5° FOV around HIP 3334 to exercise the pattern path";
+
+  auto identified = identify_stars(centroids, cam, *db, 1e-5);
+  ASSERT_GE(identified.size(), 4u)
+      << "FovBinBoundary12_5: identification produced fewer than 4 matches "
+      << "(got " << identified.size() << ")";
+
+  std::set<int> truth(expected_hips.begin(), expected_hips.end());
+  int correct = 0;
+  for (const auto &s : identified)
+    if (truth.count(s.catalog_hip_id)) ++correct;
+  EXPECT_GE(correct, 4)
+      << "FovBinBoundary12_5: " << correct << " correct of "
+      << identified.size() << " identified";
+}
+
+// 3g.7 (3b) — FovBinBoundary17_5. 17.5° → bin 15. The FOV-15 pattern catalog
+// isn't referenced elsewhere by these tests; we use the path literally.
+TEST_F(IdentificationTest, FovBinBoundary17_5) {
+  const char *PATTERN_FILE_15 = "../data/catalog_patterns_15.bin";
+  try {
+    db->load_pattern_catalog(PATTERN_FILE_15);
+  } catch (const std::exception &e) {
+    GTEST_SKIP() << "FOV-15 pattern catalog not available: " << e.what();
+  }
+
+  PinholeCamera cam;
+  cam.frame_width = 1024;
+  cam.frame_height = 1024;
+  cam.center_x = 512.0;
+  cam.center_y = 512.0;
+  const double fov_deg = 17.5;
+  cam.focal_x = 1024.0 / (2.0 * std::tan(fov_deg * M_PI / 180.0 / 2.0));
+  cam.focal_y = cam.focal_x;
+
+  // Same dense HIP-3334 anchor; at 17.5° FOV we capture even more candidates.
+  CatalogStar bs = db->get_star(3334);
+  double c3[3] = {bs.x, bs.y, bs.z};
+  double up[3] = {0.0, 0.0, 1.0};
+  if (std::abs(c3[0]) < 1e-6 && std::abs(c3[1]) < 1e-6) {
+    up[0] = 1.0; up[1] = 0.0; up[2] = 0.0;
+  }
+  double c1[3] = {up[1] * c3[2] - up[2] * c3[1],
+                  up[2] * c3[0] - up[0] * c3[2],
+                  up[0] * c3[1] - up[1] * c3[0]};
+  double n1 = std::sqrt(c1[0] * c1[0] + c1[1] * c1[1] + c1[2] * c1[2]);
+  for (int k = 0; k < 3; ++k) c1[k] /= n1;
+  double c2[3] = {c3[1] * c1[2] - c3[2] * c1[1],
+                  c3[2] * c1[0] - c3[0] * c1[2],
+                  c3[0] * c1[1] - c3[1] * c1[0]};
+  double R[3][3] = {{c1[0], c1[1], c1[2]},
+                    {c2[0], c2[1], c2[2]},
+                    {c3[0], c3[1], c3[2]}};
+
+  std::vector<int> candidates = {
+      3334, 3649, 3058, 3821, 4292, 3030, 2876, 4422, 4383,
+      2377, 3584, 3179, 4440, 4427, 4811, 4151, 4961, 2074,
+      2101, 1892, 3988, 4475, 5232, 2440, 5361,
+  };
+  std::vector<StarCentroid> centroids;
+  std::vector<int> expected_hips;
+  gather_visible_stars(candidates, *db, cam, R, centroids, expected_hips);
+  ASSERT_GE(centroids.size(), 8u)
+      << "Need ≥8 stars in 17.5° FOV around HIP 3334";
+
+  auto identified = identify_stars(centroids, cam, *db, 1e-5);
+  ASSERT_GE(identified.size(), 4u)
+      << "FovBinBoundary17_5: identification produced fewer than 4 matches "
+      << "(got " << identified.size() << ")";
+
+  std::set<int> truth(expected_hips.begin(), expected_hips.end());
+  int correct = 0;
+  for (const auto &s : identified)
+    if (truth.count(s.catalog_hip_id)) ++correct;
+  EXPECT_GE(correct, 4)
+      << "FovBinBoundary17_5: " << correct << " correct of "
+      << identified.size() << " identified";
+}

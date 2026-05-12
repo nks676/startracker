@@ -79,57 +79,6 @@ TEST(ImageProcessingTest, NoiseRejection) {
   EXPECT_EQ(centroids.size(), 0u);
 }
 
-// --- Background subtraction tests ---
-
-TEST(ImageProcessingTest, SubtractBackgroundGradientPreservesStars) {
-  const int W = 256, H = 256;
-  std::vector<uint8_t> img(W * H, 0);
-
-  // bg(x,y) = 30 + (x/4) — ramps 30..94 left to right.
-  for (int y = 0; y < H; ++y) {
-    for (int x = 0; x < W; ++x) {
-      img[y * W + x] = static_cast<uint8_t>(30 + (x / 4));
-    }
-  }
-
-  // Three bright 3x3 spots well inside the border margin (>=5 px from edge).
-  struct Pt {
-    int x, y;
-  };
-  Pt truth[3] = {{40, 40}, {128, 128}, {200, 200}};
-  for (auto p : truth) {
-    paint_spot(img, W, p.x, p.y, 230, 200);
-  }
-
-  auto bg_sub = subtract_background(img.data(), W, H, 64);
-
-  // Far from any star, background should be near zero (within a few ADU).
-  EXPECT_LT(bg_sub[10 * W + 220], 10);
-
-  auto centroids = extract_centroids(bg_sub.data(), W, H, 50);
-  ASSERT_EQ(centroids.size(), 3u);
-
-  // Sort by x so we can compare in deterministic order.
-  std::sort(centroids.begin(), centroids.end(),
-            [](const StarCentroid &a, const StarCentroid &b) {
-              return a.x < b.x;
-            });
-  for (size_t i = 0; i < 3; ++i) {
-    EXPECT_NEAR(centroids[i].x, truth[i].x, 0.5);
-    EXPECT_NEAR(centroids[i].y, truth[i].y, 0.5);
-  }
-}
-
-TEST(ImageProcessingTest, SubtractBackgroundFlatImageGoesToZero) {
-  const int W = 128, H = 128;
-  std::vector<uint8_t> img(W * H, 50);
-  auto bg_sub = subtract_background(img.data(), W, H, 64);
-  // Should be uniformly near 0 (median of 50 is exactly 50 -> result 0).
-  for (auto v : bg_sub) {
-    EXPECT_LE(static_cast<int>(v), 2);
-  }
-}
-
 // --- Adaptive thresholding tests ---
 
 TEST(ImageProcessingTest, AdaptiveHandlesSplitBackground) {
