@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """test_real_images.py — regression test for the startracker pipeline on
 real camera images. For each truth fixture in tests/data/real_images/*.json,
-downloads the referenced TIFF (cached on disk), converts to 8-bit PNG using
-PIL's default 16->8 scaling, runs the startracker binary, and asserts that
-the recovered attitude is within attitude_tolerance_deg of the plate-solved
-truth quaternion.
+downloads the referenced TIFF (cached on disk), feeds it directly to the
+startracker binary (which now reads 16-bit grayscale TIFF natively), and
+asserts the recovered attitude is within attitude_tolerance_deg of the
+plate-solved truth quaternion.
 
-This test relies on the adaptive thresholding (3a.3) handling arbitrary
-camera backgrounds without manual preprocessing. Truth quaternions were
-computed once via nova.astrometry.net and committed; no astrometry.net
-access is needed at test time.
+Truth quaternions were computed once via nova.astrometry.net and committed;
+no astrometry.net access is needed at test time.
 
 Usage:
     python tools/test_real_images.py [--binary PATH] [--fixtures-dir PATH]
@@ -27,7 +25,7 @@ import urllib.request
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image  # noqa: F401  (kept for tiff_to_png back-compat helper)
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -47,30 +45,18 @@ def download_if_missing(url: str, dest: Path) -> None:
 
 
 def tiff_to_png(tiff_path: Path, png_path: Path) -> None:
-    """Convert a higher-bit-depth grayscale TIFF to 8-bit PNG using a noise-
-    calibrated linear stretch: median (background) maps to 50 ADU, and
-    median + 5*MAD-sigma maps to 100 (the empirical "bright pixel" floor).
-    Stars saturate near 255. This matches the synthetic-data noise model
-    (bg=50, sigma=5) so adaptive thresholding sees similar statistics on
-    both real and synthetic input. For 8-bit input we pass through unchanged.
-
-    Naive divide-by-256 collapses faint-star contrast against background
-    (sigma ~1 ADU after scaling); a pure percentile stretch over-saturates
-    bright stars so neighboring pixels all clip to 255 and shape filters
-    reject the resulting blobs."""
+    """DEPRECATED but kept as a public helper for any external caller still on
+    the 8-bit path. The C++ binary now reads 16-bit TIFFs natively, so the
+    regression and benchmark drivers no longer call this — they hand the raw
+    TIFF straight to the binary."""
     img = np.asarray(Image.open(tiff_path))
     if img.dtype == np.uint8:
         Image.fromarray(img, mode="L").save(png_path)
         return
     img = img.astype(np.float32)
     bg = float(np.median(img))
-    # std (not MAD) — MAD ignores bright-star pixels, producing a smaller
-    # sigma and a steeper stretch that saturates large neighborhoods around
-    # bright stars; the resulting blobs exceed the shape-filter max_pixels.
-    # std includes star outliers and is slightly larger, giving a gentler
-    # stretch that keeps bright stars at ~1-3 saturated pixels.
     sigma = float(np.std(img))
-    scale = 10.0 / max(1.0, sigma)  # bg -> 50, bg + 5*sigma -> 100
+    scale = 10.0 / max(1.0, sigma)
     out = np.clip((img - bg) * scale + 50.0, 0, 255).astype(np.uint8)
     Image.fromarray(out, mode="L").save(png_path)
 
@@ -119,12 +105,11 @@ def run_fixture(fixture_path: Path, binary: Path, work_dir: Path) -> tuple[bool,
     url = truth["source_url"]
     name = url.rsplit("/", 1)[-1]
     tiff_path = work_dir / name
-    png_path = tiff_path.with_suffix(".png")
-
     download_if_missing(url, tiff_path)
-    tiff_to_png(tiff_path, png_path)
 
-    q_est = run_startracker(binary, png_path, fov_deg, cos_tol)
+    # 3a.6: feed the raw TIFF to the binary; it reads 16-bit grayscale TIFF
+    # natively via src/tiff_reader.cpp. No PNG intermediate.
+    q_est = run_startracker(binary, tiff_path, fov_deg, cos_tol)
     err = attitude_error_deg(q_est, q_truth)
     ok = err <= tol_deg
     return ok, f"{fixture_path.stem}: err={err:.4f}° (tolerance {tol_deg:.2f}°)"

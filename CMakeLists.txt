@@ -13,6 +13,7 @@ add_library(startracker_core STATIC
     src/catalog.cpp
     src/identification.cpp
     src/estimation.cpp
+    src/tiff_reader.cpp
 )
 
 # --- Main executable ---

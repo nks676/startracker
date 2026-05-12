@@ -363,9 +363,7 @@ apply_rotation_t(const double R[3][3], const std::array<double, 3> &v) {
 //
 // On a noise-free input, this returns exactly one key, equal to
 // `pattern_key_canonical(vecs4, ids4, _)` — so it is a drop-in superset.
-std::vector<std::pair<uint64_t, std::array<int, 4>>>
-pattern_keys_noise_robust(const std::array<std::array<double, 3>, 4> &vecs4,
-                          const std::array<int, 4> &ids4, double noise_tol);
+// Declaration is in identification.h; defined below.
 
 uint64_t
 pattern_key_canonical(const std::array<std::array<double, 3>, 4> &vecs4,
@@ -1077,11 +1075,16 @@ try_verify_candidate(const std::array<int, 4> &centroid_idx_canonical,
 // verifies after the first kPatternAttempts seed centroids — that lets us
 // count fallback frequency in production.
 
-// Number of seed centroids we try (brightest N by peak). Per plan 3e.3:
-// "Stop after the first 4 attempts." Bumping has diminishing returns since
-// the catalog truncates each star's neighbor list to top-8 and the same
-// patterns recur.
-constexpr int kPatternAttempts = 4;
+// Number of seed centroids we try (brightest N by peak). Originally 4 per
+// plan 3e.3. Diagnostics in the 3e.5 follow-up (DEBUG_PATTERN_STATS) showed
+// the failure mode on noisy synthetic scenes: when one of the top-4 brightest
+// centroids isn't a catalog star (or its nearest detected neighbors aren't a
+// subset of its catalog top-8 neighbors), all 4 seeds can fail in lock-step
+// even though dimmer-seed alternatives would succeed. Bumping to 10 raises
+// the per-frame pattern-path hit rate substantially on Monte Carlo without
+// measurably increasing the success-case latency (the path returns on first
+// verify, so extra seeds are only exercised on the fallback boundary).
+constexpr int kPatternAttempts = 10;
 // Per-seed, enumerate C(kPatternKNearest, 3) triples drawn from the seed's
 // kPatternKNearest nearest in-radius neighbors. The catalog generator stores
 // patterns built from each catalog star's top-8 nearest within FOV/2, so

@@ -22,7 +22,18 @@ import numpy as np
 # from centroid IDs and map position-by-position.
 
 PATTERN_MAGIC = 0x50415431  # 'PAT1' little-endian
-K_NEAREST = 8
+PARTNERS_MAGIC = 0x50415254  # 'PART' little-endian
+# K_NEAREST controls how many of each catalog star's nearest catalog neighbors
+# get rolled up into the 4-star pattern set. Originally 8 (giving C(8,3)=56
+# patterns per seed). Diagnostics on 3e.5's Monte Carlo runs showed the
+# pattern-path miss rate was dominated by query 4-tuples that fall just
+# outside this top-8 cone — usually because a marginally-faint Vmag-7 star
+# (which the catalog ranks high by distance) couldn't be detected at the
+# noise floor, while a brighter Vmag-5 star at neighbor-rank 9-10 was
+# detected and ended up in the runtime triple. Bumping to 12 adds those
+# rank-9..12 patterns (C(12,3)=220, ≈4× growth in catalog size and a
+# corresponding ≈4× pattern-path hit-rate gain on noisy synthetic frames).
+K_NEAREST = 12
 QUANT_BITS = 10
 QUANT_SCALE = (1 << QUANT_BITS) - 1  # 1023
 
@@ -373,6 +384,101 @@ def generate_database(max_mag=6.0, fov_max=25.0,
             f.write(struct.pack('<ddd', y_min, y_max, dq))
             f.write(K.tobytes())
         print(f"Wrote k-vector index: M={M} bins, dq={dq:.6g}")
+
+    # --- Phase 3f.5: per-star partner index (mmap-friendly serialized form) ---
+    # The C++ side previously built this in-memory at startup by scanning the
+    # pair array and bucketing into a hash map (~225 ms wall, ~250 MB RSS).
+    # Serializing it lets the C++ side mmap+mlock+prefault it like the other
+    # catalog files, dropping `catalog_load` to <20 ms.
+    #
+    # File format (catalog_partners.bin):
+    #   Header (8 bytes):
+    #     int32 magic           = PARTNERS_MAGIC ('PART')
+    #     int32 num_stars       = number of distinct HIPs that own at least
+    #                             one partner entry
+    #   Per-star directory (num_stars * 16 bytes), sorted by hip_id:
+    #     int32 hip_id
+    #     int32 partner_count
+    #     int64 entry_offset    = byte offset (from file start) of this star's
+    #                             partner-entries block
+    #   Entry blocks (sum of partner_count * 16 bytes):
+    #     For each partner, written ascending by cos_val to match the existing
+    #     in-memory sort order:
+    #       double cos_val
+    #       int32  partner_hip
+    #       int32  pad           = 0 (natural 16-byte alignment so the C++ side
+    #                              can reinterpret_cast directly)
+    #
+    # We use the directory-with-offsets layout (rather than a flat
+    # variable-length stream) so the C++ side can build its hip→(ptr, count)
+    # lookup table from one O(num_stars) pass over the directory without
+    # touching the entry pages at startup. Sorted-by-hip directory means
+    # we could also binary-search it, but an unordered_map is built once and
+    # cheap to keep.
+    if num_pairs > 0:
+        # Bucket pairs by HIP (each pair contributes to both endpoints).
+        partners = {}
+        for cos_val, id1, id2 in pairs:
+            partners.setdefault(id1, []).append((cos_val, id2))
+            partners.setdefault(id2, []).append((cos_val, id1))
+        # Sort each bucket ascending by cos_val to match the C++ in-memory
+        # sort and the binary-search assumption in find_partners().
+        for k in partners:
+            partners[k].sort()
+        sorted_hips = sorted(partners.keys())
+        num_partner_stars = len(sorted_hips)
+
+        partners_file = os.path.join(out_dir, "catalog_partners.bin")
+        header_size = 2 * 4  # magic + num_stars
+        dir_entry_size = 4 + 4 + 8  # hip + count + offset
+        entry_size = 8 + 4 + 4  # cos_val + partner_hip + pad
+        dir_size = num_partner_stars * dir_entry_size
+        # Each star's entries start at: header + directory + cumulative entries.
+        entries_start = header_size + dir_size
+
+        # Build directory + flat entries array.
+        with open(partners_file, 'wb') as f:
+            # Header
+            f.write(struct.pack('<ii', PARTNERS_MAGIC, num_partner_stars))
+            # Directory: compute offsets in a first pass.
+            offset = entries_start
+            dir_bytes = bytearray(dir_size)
+            entries_offsets = {}  # hip -> byte offset
+            for idx, hip_id in enumerate(sorted_hips):
+                cnt = len(partners[hip_id])
+                struct.pack_into(
+                    '<iiq', dir_bytes, idx * dir_entry_size,
+                    int(hip_id), int(cnt), int(offset),
+                )
+                entries_offsets[hip_id] = offset
+                offset += cnt * entry_size
+            f.write(bytes(dir_bytes))
+            # Entries: pack via numpy structured array for speed.
+            rec_dtype = np.dtype([
+                ("cos_val", "<f8"),
+                ("partner_hip", "<i4"),
+                ("pad", "<i4"),
+            ])
+            total_entries = sum(len(v) for v in partners.values())
+            rec = np.empty(total_entries, dtype=rec_dtype)
+            w = 0
+            for hip_id in sorted_hips:
+                bucket = partners[hip_id]
+                n = len(bucket)
+                cos_arr = np.fromiter((b[0] for b in bucket), dtype=np.float64,
+                                      count=n)
+                hip_arr = np.fromiter((b[1] for b in bucket), dtype=np.int32,
+                                      count=n)
+                rec["cos_val"][w:w + n] = cos_arr
+                rec["partner_hip"][w:w + n] = hip_arr
+                rec["pad"][w:w + n] = 0
+                w += n
+            rec.tofile(f)
+        size_mb = os.path.getsize(partners_file) / 1e6
+        print(
+            f"Wrote per-star partner index: {num_partner_stars} stars, "
+            f"{total_entries} entries, {size_mb:.1f} MB → {partners_file}"
+        )
 
     print(f"Saved database to {out_dir}")
 

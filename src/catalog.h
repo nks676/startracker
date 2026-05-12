@@ -128,6 +128,13 @@ private:
   // failure (those are fatal); mlock failure is logged and ignored.
   std::pair<const uint8_t *, size_t> mmap_file(const std::string &path);
 
+  // Same as mmap_file but with a knob to skip mlock + prefault. Used by the
+  // 198 MB partner index, whose access pattern is sparse enough that
+  // prefaulting the whole file costs more cold-start latency than it saves
+  // in steady-state fault avoidance.
+  std::pair<const uint8_t *, size_t> mmap_file_ex(const std::string &path,
+                                                  bool pin_and_prefault);
+
   // star_map remains heap-allocated: file is small (435 KB), and the hash
   // table itself can't live in a mmap'd file.
   std::unordered_map<int, CatalogStar> star_map;
@@ -140,12 +147,30 @@ private:
   size_t pairs_count_ = 0;
 
   // Per-star index: hip -> sorted (cos_distance, partner_hip) entries.
-  // Built once in the constructor from the mapped pair array. Memory: 2 *
-  // |pairs| entries. Note that this index dwarfs the pair file itself in
-  // RAM (~250 MB vs 99 MB), so Phase 3f.4's mmap win is on the *file read*,
-  // not on overall RSS.
-  std::unordered_map<int, std::vector<std::pair<double, int>>>
-      per_star_partners;
+  //
+  // Phase 3f.5: index is loaded from a pre-serialized `catalog_partners.bin`
+  // file when available (mmap'd, mlocked, prefaulted just like pairs/kvec/
+  // patterns). The in-memory lookup table is a hip → (ptr, count) view into
+  // the mmap'd entries. Owns nothing — lifetime is tied to the corresponding
+  // MmapRegion.
+  //
+  // Fallback path (file missing): we build the old owned vector form by
+  // walking the mmap'd pair array. This preserves correctness for stale
+  // `data/` directories at the cost of the ~225 ms startup hit.
+  //
+  // On-disk entry: 16 bytes (double cos_val, int32 partner_hip, int32 pad).
+  // Pad lets the array start on a natural 8-byte boundary after the header
+  // and lets the C++ side reinterpret_cast directly without UB about
+  // misaligned doubles. Static_asserted to 16 bytes in catalog.cpp.
+  struct PartnerEntry {
+    double cos_val;
+    int32_t partner_hip;
+    int32_t pad;
+  };
+  std::unordered_map<int, std::pair<const PartnerEntry *, size_t>>
+      partners_index_;
+  // Owned fallback storage. Empty in the mmap-loaded path.
+  std::unordered_map<int, std::vector<PartnerEntry>> partners_fallback_;
 
   // Mortari k-vector index. `kvec_K_ptr_[i]` is the largest index j in the
   // descending pairs array such that pairs[j].cos_val >= y_min + i * dq.

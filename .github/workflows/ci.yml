@@ -38,3 +38,35 @@ jobs:
 
       - name: Monte Carlo Validation
         run: bash tests/test_monte_carlo.sh
+
+  build-arm64-cross:
+    # Cross-compile only: catches alignment / endianness / missing-intrinsic
+    # bugs ahead of deploying to the Raspberry Pi 4/5 (aarch64-linux-gnu).
+    # We do NOT run the binary or ctest here — emulation under QEMU on GHA
+    # is slow enough that pure compile-and-link is the better signal.
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake git \
+            g++-aarch64-linux-gnu gcc-aarch64-linux-gnu
+
+      - name: Configure (aarch64-linux-gnu)
+        run: |
+          cmake -B build-arm64 \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64-linux-gnu.cmake \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build (startracker_core, startracker, startracker_tests)
+        run: cmake --build build-arm64 --parallel
+
+      - name: Verify binaries are aarch64 ELF
+        run: |
+          file build-arm64/startracker
+          file build-arm64/startracker_tests
+          file build-arm64/startracker | grep -q 'ARM aarch64'

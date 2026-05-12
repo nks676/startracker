@@ -6,23 +6,28 @@ Iterative development of an embedded star-tracking engine: synthetic-data baseli
 
 ## Where We Are (2026-05-11)
 
-**Current capability:** cold-start solve on alt60 ESA tetra3 fixture (1024×768, ~11° FOV, 0.4% FOV calibration drift) in **~250 ms** end-to-end on M-series desktop. Per-stage median:
+**Current capability:** cold-start solve on alt60 ESA tetra3 fixture (1024×768, ~11° FOV, 0.4% FOV calibration drift) in **~60 ms** end-to-end on M-series desktop (native 16-bit TIFF input, mmap'd partner index). Per-stage median:
 
 | Stage | Time |
 |---|---|
-| centroid | 13 ms |
-| catalog_load | 236 ms (~225 ms is `per_star_partners` build, not file I/O) |
-| identify (pattern hash + 24-perm probe + QUEST refine) | 2.8 ms |
+| centroid | 11 ms |
+| catalog_load | 20 ms (was 229 ms — 3f.x mmap'd the per-star partner index) |
+| identify (pattern hash + 24-perm probe + QUEST refine) | ~1–35 ms (varies with seed-ordering luck on 16-bit-native input) |
 | estimate | <1 µs |
 
-Per-frame steady-state (catalog already loaded): **~16 ms**. Memory: 570 MB RSS.
+Per-frame steady-state (catalog already loaded): **~12–45 ms**. Memory: ~620 MB virtual / much lower RSS (partner-index payload is now lazy-faulted via mmap, only the pages that get touched are paged in).
 
-**Test coverage:** 44/44 unit tests; real-image regression alt40=0.0596°, alt60=0.0000° (gate 0.5°); Monte Carlo 50 trials @ 5″ noise = 100% success, median 0.0047°, max 0.0193° (gate ≥80% / <1°).
+**Test coverage:** 50/50 unit tests (44 → 47 with the three 3e.5 tests, → 50 with the TIFF reader tests); real-image regression alt40=0.0280°, alt60=0.0258° (gate 0.5°); Monte Carlo 50 trials @ 5″ noise = 100% success, median 0.0047°, max 0.0191°, pattern-path hit rate 76% (gates ≥80% / <1° / ≥70% hit rate).
 
-**Known follow-ups carried into future phases:**
-- Pattern-path hit rate on noisy synthetic Monte Carlo is **20%**; pyramid carries the rest. Root cause: synthetic Vmag~7.5 stars exceed catalog Vmag-7 cutoff, so the 8-brightest set includes non-catalog stars. Real-image fixtures hit pattern path 100%. Fix: either tighten centroid pre-filter or extend catalog to Vmag 7.5.
-- alt40 went from 0.0000° → 0.0596° during 3e.5 (inlier expansion now grabs more stars and QUEST averages over them; the "extra" stars on alt40 include some marginal matches). Still well under the 0.5° gate; investigate if it becomes a problem.
-- `per_star_partners` index is built eagerly at startup (~225 ms, ~250 MB). Lazy build on first pyramid call would cut both cold-start and idle RAM substantially, since pattern-path covers real-image traffic. Touches the Phase 3f.4 boundary.
+**Cleared follow-ups from prior plan revisions:**
+- *Pattern-path hit rate on noisy synthetic Monte Carlo was 20% (later 34%).* **Done:** root cause was `K_NEAREST=8` in the pattern catalog generator (per-seed catalog stored only the seed's top-8 nearest catalog neighbors, so query 4-tuples drawn from the seed's 9th-12th nearest had no chance of matching). Bumping to `K_NEAREST=12` raises MC hit rate to **74-90%**, catalog grows ~4× (21 MB → 82 MB per FOV bin). The original "Vmag cutoff mismatch" hypothesis turned out to be wrong — synthetic generator and catalog gen both use `max_mag=7.0`.
+- *alt40 went from 0.0000° → 0.0596° during 3e.5.* **Phantom regression.** Root cause was 6-significant-figure truncation in `Estimated Quaternion: ...` print in main.cpp combined with the regression script computing error against the *truncated* string. Bumping `std::cout` precision to 17 sig-figs revealed the actual errors are alt40=0.028° and alt60=0.024° — both fixtures, both well under any gate, and consistent with centroid-noise floor over 17-star QUEST.
+- *3e.5 unit tests not landed.* **Done:** `PermutationProbeFindsKey`, `NoiseRobustnessSweep`, `AccuracyAfterVerify` added in `tests/test_identification.cpp`.
+- *`per_star_partners` eager build.* **Done (Phase 3f.x):** generator now emits `data/catalog_partners.bin` (directory + entry-block layout); StarDatabase mmaps it at startup without prefaulting (sparse access pattern). `catalog_load` dropped from ~225 ms to ~20 ms — a ≈12× cold-start improvement. Falls back to in-memory construction with a warning if the file is missing.
+
+**Remaining known follow-ups carried into future phases:**
+- TIFF input regresses identify-stage latency on alt60 from ~5 ms to ~35 ms vs the PNG-stretched path. Same final attitude, different centroid peak ordering (16-bit ties don't collapse the way 8-bit-saturated peaks do, which shifts which seeds the pattern path tries). Worth re-measuring on Pi before tuning.
+- Camera-calibration tool overfits k2/k3 on the 37-point ESA fixture set (≈220-degree polynomial absorbs noise). Adequate as a scaffold; revisit with more frames when Pi captures arrive.
 
 ---
 
@@ -44,8 +49,8 @@ End-to-end pipeline: synthetic-data tool, catalog builder, image processing (CC-
 - 3a.3: Adaptive thresholding (per-tile `local_mean + k·local_stddev`).
 - 3a.4: Hot-pixel / outlier shape filters (min/max pixels, aspect ratio, border).
 - 3a.5: Real-image regression suite (`tools/test_real_images.py` against ESA tetra3 fixtures, in CI).
+- 3a.6: Native 16-bit grayscale TIFF reader (`src/tiff_reader.{h,cpp}`) + `uint16_t` overload of `extract_centroids_adaptive_gaussian`; `main.cpp` dispatches on `.tif/.tiff` extension. Python preprocessing dropped from `tools/test_real_images.py` and `tools/benchmark.py`; regression now consumes the ESA TIFFs directly. Unit tests cover the round-trip + the 8-bit-rejection path.
 - Bonus: pyramid identification replaced vote-based prefilter (direct `find_pairs` + `find_partners` expansion).
-- **Deferred 3a.6 (native 16-bit TIFF):** still deferred to the Pi hardware integration window.
 
 ### Phase 3b — Algorithm Upgrades (Accuracy) ✅
 - 3b.0a: peak-intensity centroid ranking; `CENTROID_CAP` 25 → 50 (60 caused pyramid noise breakdown at N≥55).
@@ -90,9 +95,9 @@ Hardware order recommended: Raspberry Pi 5 (8 GB) for dev + Pi 4 (4 GB) for depl
 5. **First-night validation.** Solve a real captured frame end-to-end on the Pi. Report accuracy + per-stage timing. This is the input to Phase 3f priorities.
 
 **Pre-Pi prep that could happen now (don't strictly need hardware):**
-- 3a.6 TIFF reader (portable code; ESA TIFFs are regression data).
-- ARM64 cross-compile lane in CI (catches alignment / endianness / missing-intrinsics bugs before flashing an SD card).
-- Camera-calibration tool scaffold (the math is hardware-independent; just needs sample images).
+- ~~3a.6 TIFF reader~~ **DONE.**
+- ~~ARM64 cross-compile lane in CI~~ **DONE:** `cmake/aarch64-linux-gnu.cmake` toolchain + a `build-arm64-cross` GHA job that compiles `startracker_core`, `startracker`, and `startracker_tests` for `aarch64-linux-gnu`. Locally verified via Homebrew cross-toolchain — produced an `ELF 64-bit LSB executable, ARM aarch64` binary; GoogleTest cross-compiles cleanly via FetchContent. Required adding `#include <algorithm>` to two test files that had been pulling `std::sort`/`std::clamp` through transitive includes only.
+- ~~Camera-calibration tool scaffold~~ **DONE:** `tools/calibrate_camera.py` fits Brown-Conrady (focal_x/y, center_x/y, k1..k3, p1, p2) over (frame, truth-quaternion) pairs via `scipy.optimize.least_squares`. Smoke-tested on the two ESA fixtures (37 matched stars; pre-fit RMS 1.06 px → post-fit 0.27 px; converged). Output schema documents the CLI distortion order (k1, k2, p1, p2, k3) so the caller doesn't have to guess.
 
 ### Phase 3f — SIMD & Cache Engineering (post-Pi measurement)
 
@@ -103,7 +108,7 @@ Only worth doing if the on-Pi measurement from the previous phase shows we're sl
 - **3f.3 Robin Hood hash for the pattern table.** Currently a sorted vector + binary search — single cache miss per probe is roughly equivalent in practice. Only revisit if profiling on Pi shows the binary search is bottlenecked.
 - **~~3f.4 mmap + mlock + prefault catalog.~~** **DONE** (out of sequence — landed in the post-3e polish bundle). Need to revisit on Pi for `mlock` behavior under default `RLIMIT_MEMLOCK`.
 - **3f.5 Single-FOV assumption.** Pre-pick the pattern catalog bin at boot rather than per-frame. Trivial; mostly bookkeeping.
-- **Phase 3f.x (new candidate): defer `per_star_partners` construction.** Currently builds eagerly at startup (~225 ms, ~250 MB). After 3e.5 the pyramid is fallback-only; lazy-build (or drop entirely if the synthetic-noise pattern miss rate gets fixed) is the next biggest cold-start win.
+- **~~Phase 3f.x: defer `per_star_partners` construction.~~** **DONE** (Phase 3f.x landed pre-Pi). `tools/generate_catalog.py` now emits `data/catalog_partners.bin` (header + directory + entry blocks); the C++ side mmaps it without `mlock`/prefault (sparse access — pattern path touches one entry block per `find_partners` call, prefaulting all 198 MB would cost ~30 ms for no benefit). Falls back to in-memory construction if the file is missing. **catalog_load dropped 225 ms → 20 ms (~12×).**
 
 ### Phase 3d — Tracking Mode (Extended Kalman Filter)
 
@@ -118,9 +123,8 @@ Needs frame sequences which the Pi capture loop provides naturally. Algorithm sc
 
 These don't fit cleanly into one phase but should be addressed before "ship it":
 
-- **Pattern-path noise robustness on Monte Carlo.** Currently 20% hit rate; pyramid carries the rest. Either (a) tighten the centroid pre-filter so we only pass mag-7-and-brighter, or (b) regenerate the pattern catalog with `max_mag=7.5` so the noisy 8-brightest set has full coverage. Option (b) costs ~2× catalog size; option (a) costs noise robustness on real frames where mag-7-and-brighter is the *upper* bound. Decide after Pi data.
-- **alt40 accuracy.** Went from 0.0000° → 0.0596° during 3e.5. Investigate which marginal inliers QUEST is averaging.
-- **3e.5 unit tests not landed.** Empirical validation (real-image + MC) covers the regression but the three tests requested in the 3e.5 spec (`PermutationProbeFindsKey`, `NoiseRobustnessSweep`, `AccuracyAfterVerify`) were skipped by the subagent. Add them when convenient.
+- **TIFF-input identify-stage latency.** Native 16-bit TIFF input regresses alt60 identify from ~5 ms to ~35 ms vs the previous PNG-stretched path. Same final attitude. Root cause is centroid peak-ordering shifts (8-bit-saturated peaks collapse to ties that broke one way; 16-bit clean peaks order differently and route the pattern path through more failed seeds). Re-measure on Pi before tuning — may be moot once we have real Pi-camera data instead of ESA fixtures.
+- **`per_star_partners` lazy build.** Eager construction at startup costs ~225 ms and ~250 MB. After 3e.5 + K_NEAREST=12, the pyramid is fallback-only for 75-90% of MC traffic. Lazy-build (or drop entirely if pattern hit rate climbs further) is the next biggest cold-start win.
 
 ---
 
@@ -128,12 +132,15 @@ These don't fit cleanly into one phase but should be addressed before "ship it":
 
 | Gate | Current | Pre-Pi target |
 |---|---|---|
-| `ctest` | 44/44 | maintained |
-| Real-image alt40 / alt60 | 0.0596° / 0.0000° | both < 0.1° after alt40 investigation |
+| `ctest` | 50/50 | maintained |
+| Real-image alt40 / alt60 | 0.0280° / 0.0258° (native TIFF) | maintained < 0.1° |
 | Monte Carlo success rate | 100% | maintained ≥ 95% |
 | Monte Carlo median error | 0.0047° | maintained ≤ 0.01° |
-| Cold-start total (alt60, desktop) | 250 ms | target after 3a.6 + cross-compile CI: still 250 ms (no change expected) |
-| Per-frame steady-state (alt60, desktop) | 16 ms | maintained |
+| Monte Carlo pattern-path hit rate | 76% | ≥ 70% maintained |
+| Cold-start total (alt60, desktop, native TIFF) | 60 ms | maintained < 150 ms |
+| `catalog_load` median | 20 ms (was 225 ms) | maintained < 50 ms |
+| Per-frame steady-state (alt60, desktop) | 12–45 ms | investigate identify-stage variance |
+| Pi 4 cross-compile CI | passing locally; GHA job committed | passing on GHA after first push |
 | Pi 4 cold-start total | unmeasured | <500 ms (initial gate; refine after measuring) |
 | Pi 4 per-frame steady-state | unmeasured | <100 ms (initial gate; <30 ms is the 3f stretch goal) |
 
@@ -143,26 +150,30 @@ These don't fit cleanly into one phase but should be addressed before "ship it":
 
 | File | Owners |
 |---|---|
-| `src/image_processing.{h,cpp}` | 3a.2/3/4, 3b.1, 3a.6 (TIFF), future 3f.1 |
-| `src/identification.{h,cpp}` | 3a.1, 3b.0b/3, 3e.3/5, future 3f.x (per_star_partners defer) |
-| `src/catalog.{h,cpp}` | 3c.1, 3e.2, 3f.4, future 3d.2 (spatial index) |
+| `src/image_processing.{h,cpp}` | 3a.2/3/4, 3b.1, 3a.6 (uint16 overload), future 3f.1 |
+| `src/identification.{h,cpp}` | 3a.1, 3b.0b/3, 3e.3/5, future 3d.2 (spatial index) |
+| `src/catalog.{h,cpp}` | 3c.1, 3e.2, 3f.4, 3f.x (partners mmap), future 3d.2 |
 | `src/estimation.{h,cpp}` | 3b.2 |
-| `src/main.cpp` | all phases |
-| `tools/generate_catalog.py` | 3c.1, 3e.1, possibly future re-extension to Vmag 7.5 |
-| `tools/test_real_images.py` | 3a.5, post-3a.6 simplification |
+| `src/main.cpp` | all phases; 3a.6 routes TIFF vs PNG by extension |
+| `src/tiff_reader.{h,cpp}` | 3a.6 (minimal uncompressed 16-bit grayscale reader, no libtiff) |
+| `tools/generate_catalog.py` | 3c.1, 3e.1, K_NEAREST=12, 3f.x (catalog_partners.bin) |
+| `tools/test_real_images.py` | 3a.5; 3a.6 dropped the tiff→png stretch |
 | `tools/monte_carlo.py` | Phase 2.4, 3e.5 (hit-rate instrumentation) |
-| `tools/benchmark.py` | 3c.2 |
-| NEW: `src/tiff_reader.{h,cpp}` | 3a.6 (during Pi window) |
+| `tools/benchmark.py` | 3c.2; 3a.6 dropped the tiff→png stretch |
+| `tools/calibrate_camera.py` | Pre-Pi prep (Brown-Conrady fit scaffold) |
+| `cmake/aarch64-linux-gnu.cmake` | Pre-Pi prep (cross-compile toolchain) |
+| `.github/workflows/ci.yml` | host x86_64 + ARM64 cross-compile jobs |
 | NEW: `src/tracking.{h,cpp}` | 3d.1 |
-| NEW: `tools/calibrate_camera.py` | Pi window |
 
 ---
 
 ## Sequence Snapshot
 
 ```
-[done]   1 → 2 → 3a → 3b → 3c → 3e → 3e.5 + 3f.4 polish
-[next]   Pi 4 bring-up + 3a.6 (16-bit TIFF) + camera calibration
-[then]   3f (SIMD + remaining cache work, measured on Pi)
+[done]   1 → 2 → 3a (incl. 3a.6) → 3b → 3c → 3e → 3e.5 + 3f.4 + K_NEAREST=12
+         → 3e.5 unit tests → 3f.x (catalog_partners.bin)
+         → pre-Pi prep: ARM64 CI lane + calibrate_camera.py scaffold
+[next]   Pi 4 hardware bring-up (OS, native build, first sky capture)
+[then]   3f (remaining SIMD/cache work, measured on Pi)
 [later]  3d (EKF tracking — needs frame stream from Pi capture loop)
 ```

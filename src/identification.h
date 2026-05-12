@@ -69,3 +69,19 @@ identify_stars(const std::vector<StarCentroid> &image_stars,
 uint64_t pattern_key_canonical(const std::array<std::array<double, 3>, 4> &vecs4,
                                const std::array<int, 4> &ids4,
                                std::array<int, 4> &out_canonical);
+
+// Phase 3e.5: enumerate the set of pattern keys consistent with the input
+// 4-tuple under centroid noise. Edge-rank flips at the canonical sort happen
+// when the gap between adjacent sorted distances is below the noise floor;
+// this function returns the union of all keys reachable by swapping such
+// uncertain adjacent pairs. The first entry is always the noise-free
+// canonical key (output of pattern_key_canonical). Deduplicated.
+//
+// `noise_tol` is in radians; values around the expected per-edge angle noise
+// (a few × centroid_noise_rad) are appropriate.
+//
+// Exposed in the header so the unit test (PermutationProbeFindsKey) can
+// drive it directly without rebuilding the algorithm.
+std::vector<std::pair<uint64_t, std::array<int, 4>>>
+pattern_keys_noise_robust(const std::array<std::array<double, 3>, 4> &vecs4,
+                          const std::array<int, 4> &ids4, double noise_tol);

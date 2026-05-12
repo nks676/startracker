@@ -44,7 +44,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_real_images import (  # type: ignore[import-not-found]
     REPO_ROOT,
     download_if_missing,
-    tiff_to_png,
 )
 
 
@@ -86,8 +85,10 @@ def run_once(
 
 
 def prepare_fixture_images(work_dir: Path) -> list[tuple[str, Path, float, float | None]]:
-    """Download + convert every JSON fixture, returning the list of inputs
-    (label, png_path, fov_deg, cos_tol) the benchmark should iterate."""
+    """Download every JSON fixture's TIFF, returning the list of inputs
+    (label, tiff_path, fov_deg, cos_tol) the benchmark should iterate. The
+    binary now reads 16-bit TIFF natively (Phase 3a.6), so no PNG conversion
+    is needed."""
     fixtures = sorted(
         (REPO_ROOT / "tests" / "data" / "real_images").glob("*.json")
     )
@@ -98,15 +99,13 @@ def prepare_fixture_images(work_dir: Path) -> list[tuple[str, Path, float, float
         url = truth["source_url"]
         name = url.rsplit("/", 1)[-1]
         tiff_path = work_dir / name
-        png_path = tiff_path.with_suffix(".png")
         try:
             download_if_missing(url, tiff_path)
-            tiff_to_png(tiff_path, png_path)
         except Exception as e:  # noqa: BLE001 — diagnostics only
             print(f"  WARN: could not prepare {fx.stem}: {e}", file=sys.stderr)
             continue
         inputs.append(
-            (fx.stem, png_path, float(truth["fov_horizontal_deg"]),
+            (fx.stem, tiff_path, float(truth["fov_horizontal_deg"]),
              truth.get("cos_tol"))
         )
     return inputs

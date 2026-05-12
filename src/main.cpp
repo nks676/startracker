@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <iomanip>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -12,6 +13,7 @@
 #include "estimation.h"
 #include "identification.h"
 #include "image_processing.h"
+#include "tiff_reader.h"
 
 int main(int argc, char **argv) {
   // Peel off the optional `--benchmark` flag from any positional slot before
@@ -58,16 +60,44 @@ int main(int argc, char **argv) {
   double p2 = (argc == 11) ? std::stod(argv[9]) : 0.0;
   double k3 = (argc == 11) ? std::stod(argv[10]) : 0.0;
 
-  // Load Image
-  int width, height, channels;
-  uint8_t *image_data =
-      stbi_load(img_path.c_str(), &width, &height, &channels, 1);
-  if (!image_data) {
-    std::cerr << "Failed to load image: " << img_path << "\n";
-    return 1;
+  // Load Image. .tif/.tiff route through the native 16-bit reader; everything
+  // else (PNG, JPEG, BMP) goes through stb_image at 8-bit. Detection is by
+  // file extension — simple and matches the regression fixture naming.
+  auto ends_with_ci = [](const std::string &s, const std::string &suffix) {
+    if (suffix.size() > s.size()) return false;
+    for (size_t i = 0; i < suffix.size(); ++i) {
+      char a = s[s.size() - suffix.size() + i];
+      char b = suffix[i];
+      if (a >= 'A' && a <= 'Z') a = static_cast<char>(a + ('a' - 'A'));
+      if (a != b) return false;
+    }
+    return true;
+  };
+  const bool is_tiff =
+      ends_with_ci(img_path, ".tif") || ends_with_ci(img_path, ".tiff");
+
+  int width = 0, height = 0;
+  std::vector<uint16_t> image16;
+  uint8_t *image_data = nullptr;
+  int channels = 0;
+  if (is_tiff) {
+    try {
+      read_tiff16_grayscale(img_path, image16, width, height);
+    } catch (const std::exception &e) {
+      std::cerr << "Failed to load TIFF (" << img_path << "): " << e.what()
+                << "\n";
+      return 1;
+    }
+  } else {
+    image_data = stbi_load(img_path.c_str(), &width, &height, &channels, 1);
+    if (!image_data) {
+      std::cerr << "Failed to load image: " << img_path << "\n";
+      return 1;
+    }
   }
 
-  std::cout << "Loaded image: " << width << "x" << height << "\n";
+  std::cout << "Loaded image: " << width << "x" << height
+            << (is_tiff ? " (16-bit TIFF)" : "") << "\n";
 
   using clk = std::chrono::high_resolution_clock;
   auto t_pipeline_start = clk::now();
@@ -75,11 +105,14 @@ int main(int argc, char **argv) {
   // 1. Image Processing — adaptive per-tile thresholding handles varying
   // backgrounds across the frame (vignetting, light pollution, sensor glow).
   auto t_centroid_start = clk::now();
-  auto centroids =
-      extract_centroids_adaptive_gaussian(image_data, width, height);
+  auto centroids = is_tiff ? extract_centroids_adaptive_gaussian(
+                                 image16.data(), width, height)
+                           : extract_centroids_adaptive_gaussian(
+                                 image_data, width, height);
   auto t_centroid_end = clk::now();
   std::cout << "Extracted " << centroids.size() << " centroids.\n";
-  stbi_image_free(image_data);
+  if (!is_tiff)
+    stbi_image_free(image_data);
   if (benchmark) {
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   t_centroid_end - t_centroid_start)
@@ -174,8 +207,8 @@ int main(int argc, char **argv) {
     auto t_estimate_start = clk::now();
     Quaternion q = estimate_attitude(identified, db);
     auto t_estimate_end = clk::now();
-    std::cout << "Estimated Quaternion: [" << q.x << ", " << q.y << ", " << q.z
-              << ", " << q.w << "]\n";
+    std::cout << std::setprecision(17) << "Estimated Quaternion: [" << q.x
+              << ", " << q.y << ", " << q.z << ", " << q.w << "]\n";
     if (benchmark) {
       auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                     t_estimate_end - t_estimate_start)

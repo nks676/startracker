@@ -54,6 +54,11 @@ void prefault(const uint8_t *ptr, size_t size) {
 
 std::pair<const uint8_t *, size_t>
 StarDatabase::mmap_file(const std::string &path) {
+  return mmap_file_ex(path, /*pin_and_prefault=*/true);
+}
+
+std::pair<const uint8_t *, size_t>
+StarDatabase::mmap_file_ex(const std::string &path, bool pin_and_prefault) {
   int fd = ::open(path.c_str(), O_RDONLY);
   if (fd < 0)
     throw std::runtime_error("Could not open " + path + ": " +
@@ -84,24 +89,31 @@ StarDatabase::mmap_file(const std::string &path) {
     std::cerr << "[mmap] madvise(MADV_RANDOM) failed on " << path << ": "
               << std::strerror(errno) << " (continuing)\n";
   }
-  // Pin in physical memory so the first solve doesn't pay a page-in cost.
-  // mlock may fail on Pi 4 without `ulimit -l unlimited` / a raised
-  // RLIMIT_MEMLOCK; we treat that as a soft warning, not an error. The
-  // mapping is still valid; pages just may be evicted under pressure.
-  //
-  // mlock is documented to populate the resident set ("All pages which
-  // contain a part of the specified address range are guaranteed to be
-  // resident in RAM when the call returns successfully"), so a successful
-  // mlock implicitly prefaults. We still walk the pages on the mlock-failed
-  // path so the first solve doesn't pay a major-fault avalanche on the cold
-  // cache.
-  bool mlocked = (::mlock(ptr, size) == 0);
-  if (!mlocked) {
-    std::cerr << "[mmap] mlock failed on " << path << ": "
-              << std::strerror(errno)
-              << " (RLIMIT_MEMLOCK too low?); continuing without pin\n";
-    prefault(static_cast<const uint8_t *>(ptr), size);
+  if (pin_and_prefault) {
+    // Pin in physical memory so the first solve doesn't pay a page-in cost.
+    // mlock may fail on Pi 4 without `ulimit -l unlimited` / a raised
+    // RLIMIT_MEMLOCK; we treat that as a soft warning, not an error. The
+    // mapping is still valid; pages just may be evicted under pressure.
+    //
+    // mlock is documented to populate the resident set ("All pages which
+    // contain a part of the specified address range are guaranteed to be
+    // resident in RAM when the call returns successfully"), so a successful
+    // mlock implicitly prefaults. We still walk the pages on the mlock-failed
+    // path so the first solve doesn't pay a major-fault avalanche on the cold
+    // cache.
+    bool mlocked = (::mlock(ptr, size) == 0);
+    if (!mlocked) {
+      std::cerr << "[mmap] mlock failed on " << path << ": "
+                << std::strerror(errno)
+                << " (RLIMIT_MEMLOCK too low?); continuing without pin\n";
+      prefault(static_cast<const uint8_t *>(ptr), size);
+    }
   }
+  // pin_and_prefault==false: we deliberately leave pages unfaulted. Caller
+  // owns the cost/latency tradeoff (used by the 198 MB partner index whose
+  // access pattern is sparse — each find_partners() call touches one tiny
+  // entry block, so prefaulting all 198 MB just to save a few hundred µs
+  // of fault cost on first identify is a bad cold-start tradeoff).
   mappings_.push_back({ptr, size});
   return {static_cast<const uint8_t *>(ptr), size};
 }
@@ -173,17 +185,111 @@ StarDatabase::StarDatabase(const std::string &star_file,
       reinterpret_cast<const CatalogPair *>(pair_bytes + sizeof(int32_t));
   pairs_count_ = static_cast<size_t>(num_pairs);
 
-  // Build per-star partner index for pyramid-style identification expansion.
-  // Same logic as before — derived structures still cost RAM + CPU; the mmap
-  // win is purely on the file-read side.
-  per_star_partners.reserve(num_stars);
-  for (size_t i = 0; i < pairs_count_; ++i) {
-    const CatalogPair &p = pairs_ptr_[i];
-    per_star_partners[p.id1].emplace_back(p.cos_val, p.id2);
-    per_star_partners[p.id2].emplace_back(p.cos_val, p.id1);
+  // --- Per-star partner index (Phase 3f.5): mmap if catalog_partners.bin
+  // exists, otherwise fall back to the old in-memory build for old `data/`
+  // directories. ---
+  static_assert(sizeof(PartnerEntry) == 16,
+                "PartnerEntry must be exactly 16 bytes (double + int32 + "
+                "int32 pad) to match the on-disk layout written by "
+                "tools/generate_catalog.py");
+  std::string partners_file;
+  {
+    auto slash = pair_file.find_last_of("/\\");
+    if (slash == std::string::npos)
+      partners_file = "catalog_partners.bin";
+    else
+      partners_file = pair_file.substr(0, slash + 1) + "catalog_partners.bin";
   }
-  for (auto &kv : per_star_partners) {
-    std::sort(kv.second.begin(), kv.second.end());
+  bool partners_loaded = false;
+  if (::access(partners_file.c_str(), R_OK) == 0) {
+    try {
+      // Use the no-prefault variant: the partners file is ~200 MB (~50k
+      // pages) but find_partners only ever touches a tiny entry block per
+      // call. Prefaulting all of it would add ~30 ms to catalog_load to save
+      // a few hundred microseconds spread across the first solve — a bad
+      // trade. We explicitly touch the header + directory below (which IS
+      // walked at startup) so steady-state determinism on those is preserved.
+      auto [pbytes, psize] = mmap_file_ex(partners_file,
+                                          /*pin_and_prefault=*/false);
+      // Header: int32 magic, int32 num_stars.
+      constexpr int32_t kPartnersMagic = 0x50415254; // 'PART'
+      const size_t hdr_size = 2 * sizeof(int32_t);
+      if (psize < hdr_size)
+        throw std::runtime_error("Partners file truncated (no header)");
+      int32_t magic = 0, num_partner_stars = 0;
+      std::memcpy(&magic, pbytes, sizeof(int32_t));
+      std::memcpy(&num_partner_stars, pbytes + sizeof(int32_t),
+                  sizeof(int32_t));
+      if (magic != kPartnersMagic)
+        throw std::runtime_error("Partners file bad magic");
+      if (num_partner_stars < 0)
+        throw std::runtime_error("Partners file negative num_stars");
+
+      // Directory: num_partner_stars × (int32 hip, int32 count, int64 offset).
+      constexpr size_t kDirEntrySize =
+          sizeof(int32_t) + sizeof(int32_t) + sizeof(int64_t);
+      const size_t dir_size =
+          static_cast<size_t>(num_partner_stars) * kDirEntrySize;
+      if (psize < hdr_size + dir_size)
+        throw std::runtime_error("Partners file truncated (directory)");
+
+      partners_index_.reserve(static_cast<size_t>(num_partner_stars));
+      const uint8_t *dir_ptr = pbytes + hdr_size;
+      for (int32_t i = 0; i < num_partner_stars; ++i) {
+        int32_t hip = 0, count = 0;
+        int64_t offset = 0;
+        const uint8_t *rec = dir_ptr + i * kDirEntrySize;
+        std::memcpy(&hip, rec, sizeof(int32_t));
+        std::memcpy(&count, rec + sizeof(int32_t), sizeof(int32_t));
+        std::memcpy(&offset, rec + 2 * sizeof(int32_t), sizeof(int64_t));
+        if (count < 0 || offset < 0)
+          throw std::runtime_error("Partners file negative count/offset");
+        const size_t entry_bytes =
+            static_cast<size_t>(count) * sizeof(PartnerEntry);
+        if (static_cast<size_t>(offset) + entry_bytes > psize)
+          throw std::runtime_error(
+              "Partners file truncated (entry block past EOF for hip " +
+              std::to_string(hip) + ")");
+        const PartnerEntry *eptr = reinterpret_cast<const PartnerEntry *>(
+            pbytes + static_cast<size_t>(offset));
+        partners_index_.emplace(
+            hip, std::make_pair(eptr, static_cast<size_t>(count)));
+      }
+      partners_loaded = true;
+      std::cout << "Loaded per-star partner index: " << num_partner_stars
+                << " stars (mmap'd " << partners_file << ")\n";
+    } catch (const std::exception &e) {
+      std::cerr << "Warning: failed to mmap partners file " << partners_file
+                << ": " << e.what()
+                << "; falling back to in-memory build.\n";
+      partners_index_.clear();
+      partners_loaded = false;
+    }
+  } else {
+    std::cerr << "Warning: partners file " << partners_file
+              << " not found; building per-star index in memory "
+                 "(adds ~225ms to catalog_load). Regenerate the catalog with "
+                 "tools/generate_catalog.py to eliminate this cost.\n";
+  }
+  if (!partners_loaded) {
+    // Legacy build: bucket pairs by HIP, sort each bucket ascending by
+    // cos_val. Same semantics as the mmap path; we just own the storage.
+    partners_fallback_.reserve(num_stars);
+    for (size_t i = 0; i < pairs_count_; ++i) {
+      const CatalogPair &p = pairs_ptr_[i];
+      partners_fallback_[p.id1].push_back({p.cos_val, p.id2, 0});
+      partners_fallback_[p.id2].push_back({p.cos_val, p.id1, 0});
+    }
+    for (auto &kv : partners_fallback_) {
+      std::sort(kv.second.begin(), kv.second.end(),
+                [](const PartnerEntry &a, const PartnerEntry &b) {
+                  if (a.cos_val != b.cos_val)
+                    return a.cos_val < b.cos_val;
+                  return a.partner_hip < b.partner_hip;
+                });
+      partners_index_.emplace(
+          kv.first, std::make_pair(kv.second.data(), kv.second.size()));
+    }
   }
 
   // --- Load Mortari k-vector index (optional, via mmap) ---
@@ -247,20 +353,26 @@ StarDatabase::StarDatabase(const std::string &star_file,
 std::vector<int> StarDatabase::find_partners(int hip, double cos_target,
                                              double cos_tolerance) const {
   std::vector<int> result;
-  auto it = per_star_partners.find(hip);
-  if (it == per_star_partners.end())
+  auto it = partners_index_.find(hip);
+  if (it == partners_index_.end())
     return result;
-  const auto &lst = it->second;
-  // Sorted ascending by cos. Find range [cos_target - tol, cos_target + tol].
+  const PartnerEntry *begin = it->second.first;
+  const PartnerEntry *end = begin + it->second.second;
+  // Sorted ascending by cos_val. Find range [cos_target - tol,
+  // cos_target + tol]. Compare against cos_val only — exactly matches the
+  // previous std::pair<double, int> behavior when we used the smallest /
+  // largest int sentinel for the second field.
+  const double cos_low = cos_target - cos_tolerance;
+  const double cos_high = cos_target + cos_tolerance;
   auto lo = std::lower_bound(
-      lst.begin(), lst.end(),
-      std::make_pair(cos_target - cos_tolerance, std::numeric_limits<int>::min()));
+      begin, end, cos_low,
+      [](const PartnerEntry &e, double v) { return e.cos_val < v; });
   auto hi = std::upper_bound(
-      lst.begin(), lst.end(),
-      std::make_pair(cos_target + cos_tolerance, std::numeric_limits<int>::max()));
+      lo, end, cos_high,
+      [](double v, const PartnerEntry &e) { return v < e.cos_val; });
   result.reserve(static_cast<size_t>(hi - lo));
   for (auto p = lo; p != hi; ++p)
-    result.push_back(p->second);
+    result.push_back(p->partner_hip);
   return result;
 }
 

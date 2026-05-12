@@ -143,12 +143,12 @@ inline void refine_gaussian(const std::vector<PixelSample> &pixels, double &cx,
 // or a precomputed per-pixel adaptive threshold. When `gaussian_refine` is
 // true, each component's CoG is refined by intensity * Gaussian-weighted
 // moments (see refine_gaussian). `peak` is always populated.
-template <typename Predicate>
-std::vector<StarCentroid> extract_centroids_impl(const uint8_t *image,
-                                                 int width, int height,
-                                                 Predicate is_above,
-                                                 const CentroidFilterParams &f,
-                                                 bool gaussian_refine = false) {
+template <typename T, typename Predicate>
+std::vector<StarCentroid> extract_centroids_impl_t(const T *image, int width,
+                                                    int height,
+                                                    Predicate is_above,
+                                                    const CentroidFilterParams &f,
+                                                    bool gaussian_refine = false) {
   std::vector<StarCentroid> centroids;
   std::vector<uint8_t> visited(static_cast<size_t>(width) * height, 0);
 
@@ -276,9 +276,10 @@ namespace {
 // Build the per-pixel adaptive threshold buffer used by both the CoG and
 // Gaussian-refined adaptive extractors. Factored out of the public function
 // bodies so the two share the (non-trivial) preprocessing exactly.
-std::vector<float> build_adaptive_threshold(const uint8_t *image, int width,
-                                            int height, double k_sigma,
-                                            int tile_size) {
+template <typename T>
+std::vector<float> build_adaptive_threshold_t(const T *image, int width,
+                                              int height, double k_sigma,
+                                              int tile_size) {
   if (tile_size < 1)
     tile_size = 1;
   int n_tx = tile_count(width, tile_size);
@@ -299,9 +300,9 @@ std::vector<float> build_adaptive_threshold(const uint8_t *image, int width,
       double sum = 0.0, sum_sq = 0.0;
       int n = 0;
       for (int y = y0; y < y1; ++y) {
-        const uint8_t *row = image + y * width;
+        const T *row = image + y * width;
         for (int x = x0; x < x1; ++x) {
-          double v = row[x];
+          double v = static_cast<double>(row[x]);
           sum += v;
           sum_sq += v * v;
           n++;
@@ -340,7 +341,7 @@ std::vector<StarCentroid>
 extract_centroids(const uint8_t *image_data, int width, int height,
                   uint8_t threshold, const CentroidFilterParams &filter) {
   auto is_above = [&](int idx) { return image_data[idx] > threshold; };
-  return extract_centroids_impl(image_data, width, height, is_above, filter,
+  return extract_centroids_impl_t(image_data, width, height, is_above, filter,
                                 /*gaussian_refine=*/false);
 }
 
@@ -349,7 +350,7 @@ extract_centroids_gaussian(const uint8_t *image_data, int width, int height,
                            uint8_t threshold,
                            const CentroidFilterParams &filter) {
   auto is_above = [&](int idx) { return image_data[idx] > threshold; };
-  return extract_centroids_impl(image_data, width, height, is_above, filter,
+  return extract_centroids_impl_t(image_data, width, height, is_above, filter,
                                 /*gaussian_refine=*/true);
 }
 
@@ -357,21 +358,37 @@ std::vector<StarCentroid>
 extract_centroids_adaptive(const uint8_t *image, int width, int height,
                            double k_sigma, int tile_size,
                            const CentroidFilterParams &filter) {
-  auto thr = build_adaptive_threshold(image, width, height, k_sigma, tile_size);
+  auto thr = build_adaptive_threshold_t(image, width, height, k_sigma, tile_size);
   auto is_above = [&](int idx) {
     return static_cast<double>(image[idx]) > thr[idx];
   };
-  return extract_centroids_impl(image, width, height, is_above, filter,
+  return extract_centroids_impl_t(image, width, height, is_above, filter,
                                 /*gaussian_refine=*/false);
 }
 
 std::vector<StarCentroid> extract_centroids_adaptive_gaussian(
     const uint8_t *image, int width, int height, double k_sigma, int tile_size,
     const CentroidFilterParams &filter) {
-  auto thr = build_adaptive_threshold(image, width, height, k_sigma, tile_size);
+  auto thr = build_adaptive_threshold_t(image, width, height, k_sigma, tile_size);
   auto is_above = [&](int idx) {
     return static_cast<double>(image[idx]) > thr[idx];
   };
-  return extract_centroids_impl(image, width, height, is_above, filter,
+  return extract_centroids_impl_t(image, width, height, is_above, filter,
+                                /*gaussian_refine=*/true);
+}
+
+// 16-bit overload — same algorithm, wider pixel type. Pi HQ Camera and the
+// ESA tetra3 fixtures emit 12/16-bit raw frames; the 8-bit overload above
+// crushes faint stars on those inputs via the 16→8 stretch in
+// tools/test_real_images.py. With this overload the binary can consume the
+// native TIFF and the adaptive threshold sees the full dynamic range.
+std::vector<StarCentroid> extract_centroids_adaptive_gaussian(
+    const uint16_t *image, int width, int height, double k_sigma, int tile_size,
+    const CentroidFilterParams &filter) {
+  auto thr = build_adaptive_threshold_t(image, width, height, k_sigma, tile_size);
+  auto is_above = [&](int idx) {
+    return static_cast<double>(image[idx]) > thr[idx];
+  };
+  return extract_centroids_impl_t(image, width, height, is_above, filter,
                                 /*gaussian_refine=*/true);
 }

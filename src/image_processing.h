@@ -62,3 +62,12 @@ std::vector<StarCentroid> extract_centroids_adaptive_gaussian(
     const uint8_t *image, int width, int height, double k_sigma = 5.0,
     int tile_size = 64,
     const CentroidFilterParams &filter = CentroidFilterParams{});
+
+// 16-bit pixel-type overload. Same algorithm; just consumes the wider raster
+// produced by the TIFF reader / Pi HQ Camera path. The float-typed threshold
+// buffer is wide enough for the larger dynamic range, so no other tuning is
+// needed.
+std::vector<StarCentroid> extract_centroids_adaptive_gaussian(
+    const uint16_t *image, int width, int height, double k_sigma = 5.0,
+    int tile_size = 64,
+    const CentroidFilterParams &filter = CentroidFilterParams{});

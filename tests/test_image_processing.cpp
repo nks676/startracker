@@ -1,4 +1,5 @@
 #include "image_processing.h"
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <gtest/gtest.h>
@@ -335,4 +336,145 @@ TEST(ImageProcessingTest, PeakReflectsBrightestPixelInComponent) {
       extract_centroids_adaptive_gaussian(img.data(), W, H, 5.0, 16);
   ASSERT_GE(adaptive_g.size(), 1u);
   EXPECT_DOUBLE_EQ(adaptive_g[0].peak, 255.0);
+}
+
+#include "tiff_reader.h"
+#include <cstdio>
+#include <fstream>
+
+namespace {
+
+// Helper: write a minimal classic-TIFF (little-endian, single-strip, 16-bit
+// grayscale, no compression, BlackIsZero) so the reader has something to
+// parse without depending on an external image library. Returns the path of
+// the temp file (caller is responsible for std::remove'ing).
+std::string write_tmp_tiff16(int width, int height,
+                              const std::vector<uint16_t> &pixels) {
+  char tpl[] = "/tmp/startracker_tifftest_XXXXXX";
+  int fd = mkstemp(tpl);
+  std::string path(tpl);
+  if (fd >= 0) close(fd);
+
+  std::ofstream out(path, std::ios::binary);
+
+  // 8-byte header: 'II' + magic=42 + IFD0 offset=8 (right after header).
+  auto put16 = [&](uint16_t v) {
+    out.put(static_cast<char>(v & 0xFF));
+    out.put(static_cast<char>((v >> 8) & 0xFF));
+  };
+  auto put32 = [&](uint32_t v) {
+    out.put(static_cast<char>(v & 0xFF));
+    out.put(static_cast<char>((v >> 8) & 0xFF));
+    out.put(static_cast<char>((v >> 16) & 0xFF));
+    out.put(static_cast<char>((v >> 24) & 0xFF));
+  };
+
+  out.put('I'); out.put('I');
+  put16(42);
+  put32(8); // IFD0 offset
+
+  // IFD0: 8 entries, each 12 bytes; then 4 bytes for next-IFD offset (0).
+  // Layout: header(8) + ifd_count(2) + 8 entries × 12 + next_off(4) = 8 + 2 + 96 + 4 = 110.
+  // Strip data starts at byte 110.
+  put16(8); // entry count
+
+  auto put_entry = [&](uint16_t tag, uint16_t typ, uint32_t cnt, uint32_t val) {
+    put16(tag); put16(typ); put32(cnt); put32(val);
+  };
+  // Tags in ascending order per TIFF spec.
+  put_entry(256, 4, 1, static_cast<uint32_t>(width));   // ImageWidth (LONG)
+  put_entry(257, 4, 1, static_cast<uint32_t>(height));  // ImageLength
+  put_entry(258, 3, 1, 16);                              // BitsPerSample (SHORT) — value in low bytes
+  put_entry(259, 3, 1, 1);                               // Compression = none
+  put_entry(262, 3, 1, 1);                               // PhotometricInterp = BlackIsZero
+  put_entry(273, 4, 1, 110);                             // StripOffsets = 110 (right after IFD)
+  put_entry(277, 3, 1, 1);                               // SamplesPerPixel = 1
+  put_entry(279, 4, 1,
+            static_cast<uint32_t>(width) *
+                static_cast<uint32_t>(height) * 2); // StripByteCounts
+
+  put32(0); // next IFD offset
+
+  // Pixel data (raw little-endian uint16).
+  for (uint16_t v : pixels) {
+    out.put(static_cast<char>(v & 0xFF));
+    out.put(static_cast<char>((v >> 8) & 0xFF));
+  }
+  return path;
+}
+
+} // namespace
+
+// 3a.6 — round-trip a minimal 16-bit grayscale TIFF through the reader.
+// We synthesize the file in-place rather than checking in a binary fixture,
+// which would bloat the repo and make the test brittle to any future format
+// migrations.
+TEST(TiffReaderTest, RoundTripUint16) {
+  const int W = 8, H = 6;
+  std::vector<uint16_t> pixels(W * H);
+  for (int i = 0; i < W * H; ++i) {
+    // Pattern with high bytes set so endian handling is exercised.
+    pixels[i] = static_cast<uint16_t>(0x1234 + i * 0x111);
+  }
+  std::string path = write_tmp_tiff16(W, H, pixels);
+
+  std::vector<uint16_t> out;
+  int rw = 0, rh = 0;
+  ASSERT_NO_THROW(read_tiff16_grayscale(path, out, rw, rh));
+  EXPECT_EQ(rw, W);
+  EXPECT_EQ(rh, H);
+  ASSERT_EQ(out.size(), static_cast<size_t>(W * H));
+  for (int i = 0; i < W * H; ++i) {
+    EXPECT_EQ(out[i], pixels[i]) << "mismatch at i=" << i;
+  }
+
+  std::remove(path.c_str());
+}
+
+// 3a.6 — reader rejects an 8-bit TIFF (BitsPerSample = 8) with a clear
+// error, instead of silently producing garbage by truncating the strip.
+TEST(TiffReaderTest, Rejects8BitTiff) {
+  // Easiest path: synthesize a 16-bit TIFF and patch the BitsPerSample value
+  // before reading. We can also just write the wrong header from scratch.
+  // Do the patch route — fewer bytes touched.
+  const int W = 4, H = 2;
+  std::vector<uint16_t> pixels(W * H, 0);
+  std::string path = write_tmp_tiff16(W, H, pixels);
+  // BitsPerSample is the 3rd IFD entry, value byte at file offset
+  // header(8) + ifd_count(2) + 2 entries(24) + tag/typ/cnt(8) = 42.
+  std::fstream f(path, std::ios::in | std::ios::out | std::ios::binary);
+  f.seekp(42, std::ios::beg);
+  f.put(8); f.put(0); // overwrite low two bytes of value field with 8
+  f.close();
+
+  std::vector<uint16_t> out;
+  int rw = 0, rh = 0;
+  EXPECT_THROW(read_tiff16_grayscale(path, out, rw, rh),
+               std::runtime_error);
+  std::remove(path.c_str());
+}
+
+// 3a.6 — end-to-end: feed the 16-bit overload of
+// extract_centroids_adaptive_gaussian a TIFF-shaped buffer and confirm it
+// finds the bright spot. This exercises the templated path through
+// build_adaptive_threshold_t + extract_centroids_impl_t with T=uint16_t.
+TEST(ImageProcessingTest, Adaptive16BitFindsBrightSpot) {
+  const int W = 64, H = 64;
+  std::vector<uint16_t> img(W * H, 1000); // background ~1000 ADU
+  // Paint a 3x3 bright spot centered at (32, 32) with much higher ADU than
+  // the background. 16-bit headroom: peak ~50000, neighbors ~30000.
+  for (int dy = -1; dy <= 1; ++dy) {
+    for (int dx = -1; dx <= 1; ++dx) {
+      int x = 32 + dx, y = 32 + dy;
+      img[y * W + x] =
+          (dx == 0 && dy == 0) ? static_cast<uint16_t>(50000)
+                                : static_cast<uint16_t>(30000);
+    }
+  }
+  auto centroids =
+      extract_centroids_adaptive_gaussian(img.data(), W, H, 5.0, 16);
+  ASSERT_GE(centroids.size(), 1u);
+  EXPECT_NEAR(centroids[0].x, 32.0, 0.5);
+  EXPECT_NEAR(centroids[0].y, 32.0, 0.5);
+  EXPECT_DOUBLE_EQ(centroids[0].peak, 50000.0);
 }
