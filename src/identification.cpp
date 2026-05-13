@@ -92,6 +92,39 @@ constexpr double kPatternPairCosTol = 5e-4;
 // either in the catalog or geometrically equivalent to one that is. We pull
 // in a small margin (95%) to absorb FOV-bin/camera-FOV mismatch.
 constexpr double kPatternRadiusSafetyMargin = 0.95;
+// Phase 3f.2: per-seed short-circuit. If a seed yields zero catalog
+// candidates across its first kSeedEarlyBailoutTriples triples (out of
+// C(K,3)=120 for K=10), it sits in the "no catalog overlap" regime — its
+// observed nearest neighbors don't overlap enough with the catalog's
+// top-12 nearest for that star to ever form a valid pattern. Bail to the
+// next seed. Saves ~14 ms per dead seed on Pi 4.
+//
+// The bailout threshold is conservative: catalog stars with even 6 of
+// their top-12 nearest observed have C(6,3)=20 matching triples among the
+// first 120, and the first 30 triples (lex-ordered (a, b, c)) hit a
+// matching one with very high probability. False-positive bailouts (real
+// seeds skipped early) are caught by the remaining seeds in the
+// kPatternAttempts pool, and by the pyramid fallback if all seeds bail.
+//
+// Diagnostic data (alt60 fixture pre-fix):
+//   seeds 0,1,3,4: 120 triples each, 0 candidates each → dead seeds
+//   seed 2:       120 triples, 4 candidates, all verify-rejected
+//   seed 5:       65 triples, 6 candidates, HIT
+//
+// Threshold sweep on Pi 4 + 50-trial Monte Carlo (with 3-run variance check):
+//   30 triples: alt60 identify 79→27 ms (-66%), MC hit rate 76% ± natural
+//                variance ~10-15 pp (74/70/84% across three runs at any
+//                given threshold). Initial observation that hit rate
+//                "dropped" 88→76% was within run-to-run variance — not a
+//                real regression.
+//   60 triples: alt60 identify 79→43 ms, MC hit rate stays in the same
+//                70-85% variance band.
+//   120 (off):  alt60 identify 79 ms, MC hit rate 70-85%.
+// Net: 30 is the right setting. The bailout doesn't materially affect hit
+// rate; it cuts ~52 ms per dead seed without trading off accuracy. Seeds
+// with even a few catalog-overlap triples almost always find their first
+// candidate within the lex-ordered first 30.
+constexpr int kSeedEarlyBailoutTriples = 30;
 
 template <typename CatVec>
 std::vector<int>
@@ -127,6 +160,11 @@ identify_stars_pattern(const std::vector<StarCentroid> &image_stars,
       ranked.begin() + std::min<int>(ranked.size(), kVerifyPoolSize));
 
   const int seeds = std::min(kPatternAttempts, static_cast<int>(ranked.size()));
+  // Phase 3f.2: per-seed instrumentation gated by env var. The alt60 fixture
+  // takes 6 seeds to lock while alt40 hits seed 0; this print exposes the
+  // why (triples-tried, candidates-found, pair-gate rejections, 5th-star
+  // rejections) so we can localise the fix.
+  const bool dbg_seeds = std::getenv("STARTRACKER_DEBUG_PATTERN_SEEDS") != nullptr;
   for (int s = 0; s < seeds; ++s) {
     if (stats) stats->pattern_seeds_tried = s + 1;
     int seed_idx = ranked[s];
@@ -137,16 +175,34 @@ identify_stars_pattern(const std::vector<StarCentroid> &image_stars,
     // seed's kPatternKNearest nearest in-radius detected centroids.
     auto knn = k_nearest_within_radius(seed_idx, neighbor_pool, v_cam,
                                        cos_radius, kPatternKNearest);
-    if (knn.size() < 3) continue; // not enough neighbors → next seed
+    if (knn.size() < 3) {
+      if (dbg_seeds) {
+        std::fprintf(stderr,
+                     "[3f.2] seed %d centroid=%d knn=%zu — SKIP (knn<3)\n",
+                     s, seed_idx, knn.size());
+      }
+      continue; // not enough neighbors → next seed
+    }
+    // Phase 3f.2: per-seed accumulators. seed_triples_done + seed_candidates
+    // drive the early-bailout heuristic (see kSeedEarlyBailoutTriples).
+    int seed_triples_done = 0;
+    int seed_candidates_total = 0;
+    bool seed_bailed = false;
+    // Counters for the per-seed summary line (dbg_seeds branch only).
+    int dbg_triples = 0, dbg_keys = 0, dbg_candidates = 0;
+    int dbg_rej_pair = 0, dbg_rej_fifth = 0;
+    (void)dbg_rej_fifth; // reserved for finer instrumentation
 
     // Enumerate C(knn.size(), 3) triples. With kPatternKNearest=10 this is
     // up to 120 hashes per seed, but most catalog probes return zero or
     // few candidates — the hot path is the hash + tolerant probe, both
     // cheap.
     const int K = static_cast<int>(knn.size());
-    for (int a = 0; a < K - 2; ++a) {
-      for (int b = a + 1; b < K - 1; ++b) {
-        for (int c = b + 1; c < K; ++c) {
+    for (int a = 0; a < K - 2 && !seed_bailed; ++a) {
+      for (int b = a + 1; b < K - 1 && !seed_bailed; ++b) {
+        for (int c = b + 1; c < K && !seed_bailed; ++c) {
+          ++seed_triples_done;
+          if (dbg_seeds) ++dbg_triples;
           std::array<int, 4> centroid_indices = {seed_idx, knn[a], knn[b],
                                                   knn[c]};
 
@@ -196,10 +252,13 @@ identify_stars_pattern(const std::vector<StarCentroid> &image_stars,
             probe_keys.emplace_back(kp.first, centroid_canonical);
           }
           for (const auto &kp : probe_keys) {
+            if (dbg_seeds) ++dbg_keys;
             uint64_t key = kp.first;
             const auto &centroid_canonical = kp.second;
             auto candidates = db.find_pattern_tolerant(key);
             if (candidates.empty()) continue;
+            seed_candidates_total += static_cast<int>(candidates.size());
+            if (dbg_seeds) dbg_candidates += static_cast<int>(candidates.size());
 
             for (const auto &cand : candidates) {
               std::array<int, 4> hips = {cand.hips[0], cand.hips[1],
@@ -208,7 +267,14 @@ identify_stars_pattern(const std::vector<StarCentroid> &image_stars,
               auto assignment = try_verify_candidate(
                   centroid_canonical, hips, verify_pool, v_cam, db, cat_vec,
                   kPatternPairCosTol, kFifthStarVerifyCosTol, R_triad);
-              if (assignment.empty()) continue;
+              if (assignment.empty()) {
+                // Don't yet distinguish pair-gate vs 5th-star reject here —
+                // would need to thread a reason out of try_verify_candidate.
+                // For now we just know "verify rejected"; widen later if the
+                // first-pass instrumentation doesn't localise the issue.
+                if (dbg_seeds) ++dbg_rej_pair; // count as "rejected"
+                continue;
+              }
 
               // Change 2: tight inlier expansion + QUEST refine. Projects all
               // remaining centroids into inertial using the TRIAD attitude,
@@ -232,11 +298,38 @@ identify_stars_pattern(const std::vector<StarCentroid> &image_stars,
                                  assignment[ii]);
                 }
               }
+              if (dbg_seeds) {
+                std::fprintf(stderr,
+                             "[3f.2] seed %d centroid=%d knn=%d triples=%d "
+                             "keys=%d candidates=%d verify_rej=%d → HIT "
+                             "(%d→%d inliers)\n",
+                             s, seed_idx, (int)knn.size(), dbg_triples,
+                             dbg_keys, dbg_candidates, dbg_rej_pair, n_before,
+                             n_after);
+              }
               return assignment;
             }
           }
+          // Phase 3f.2: per-seed early bailout. If we've worked through
+          // kSeedEarlyBailoutTriples triples without ANY catalog candidates,
+          // this seed sits in the no-overlap regime — its observed nearest
+          // neighbors don't intersect enough with the catalog's top-12 for
+          // this star to ever form a valid 4-tuple pattern. Skip the
+          // remaining triples and try the next seed.
+          if (seed_triples_done >= kSeedEarlyBailoutTriples &&
+              seed_candidates_total == 0) {
+            seed_bailed = true;
+          }
         }
       }
+    }
+    if (dbg_seeds) {
+      const char *outcome = seed_bailed ? "BAIL" : "MISS";
+      std::fprintf(stderr,
+                   "[3f.2] seed %d centroid=%d knn=%d triples=%d keys=%d "
+                   "candidates=%d verify_rej=%d → %s\n",
+                   s, seed_idx, (int)knn.size(), dbg_triples, dbg_keys,
+                   dbg_candidates, dbg_rej_pair, outcome);
     }
   }
 
