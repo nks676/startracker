@@ -831,12 +831,16 @@ TEST_F(IdentificationTest, NoiseRobustnessSweep) {
   for (double sigma_arcsec : noise_arcsec) {
     const double sigma_px = sigma_arcsec * (M_PI / 180.0 / 3600.0) *
                             cam_truth.focal_x;
-    std::normal_distribution<double> jitter(0.0, sigma_px);
 
     std::vector<StarCentroid> noisy = base_centroids;
-    for (auto &c : noisy) {
-      c.x += jitter(rng);
-      c.y += jitter(rng);
+    if (sigma_px > 0.0) {
+      // libstdc++-15 asserts stddev > 0; skip the jitter on the noise-free
+      // sweep pass rather than constructing a degenerate distribution.
+      std::normal_distribution<double> jitter(0.0, sigma_px);
+      for (auto &c : noisy) {
+        c.x += jitter(rng);
+        c.y += jitter(rng);
+      }
     }
 
     auto identified = identify_stars(noisy, cam_truth, *db, 1e-5);
@@ -952,12 +956,17 @@ TEST_F(IdentificationTest, AccuracyAfterVerify) {
   std::mt19937 rng(20260511);
   for (double sigma_arcsec : noise_arcsec) {
     const double sigma_px = sigma_arcsec * (M_PI / 180.0 / 3600.0) * cam.focal_x;
-    std::normal_distribution<double> jitter(0.0, sigma_px);
 
     std::vector<StarCentroid> noisy = base_centroids;
-    for (auto &c : noisy) {
-      c.x += jitter(rng);
-      c.y += jitter(rng);
+    if (sigma_px > 0.0) {
+      // libstdc++-15 asserts stddev > 0 on normal_distribution; skip the
+      // jitter pass entirely on the noise-free pass instead of constructing
+      // a degenerate distribution.
+      std::normal_distribution<double> jitter(0.0, sigma_px);
+      for (auto &c : noisy) {
+        c.x += jitter(rng);
+        c.y += jitter(rng);
+      }
     }
 
     auto identified = identify_stars(noisy, cam, *db, 1e-5);

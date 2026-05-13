@@ -25,38 +25,49 @@ inline double tile_center(int tile_index, int tile_size, int length) {
 // Bilinearly interpolate a per-tile scalar field at pixel (x,y). Indices
 // outside [0, n_tiles-1] are clamped — pixels near image edges share the
 // background estimate of their nearest tile rather than extrapolating.
+//
+// Phase 3f.1: arithmetic tile-index lookup, was linear scan. For middle
+// tiles, tile_center(tx) = tx*tile_size + (tile_size-1)/2, so the largest
+// tx with center(tx) <= x is floor((x - (tile_size-1)/2) / tile_size).
+// (The last tile may be smaller than tile_size pixels — its center is
+// shifted left of the formula's prediction. We handle that by clamping
+// the computed tx0 to [0, n_tx-1] and then using the exact tile_center()
+// values for the bilinear weights, which absorbs the last-tile offset
+// naturally.) Old linear scan cost ~28 iterations per pixel × 786 k pixels
+// = ~85 ms on Pi 4 1024×768 — measured as the dominant centroid cost.
 template <typename T>
 double bilinear_sample(const std::vector<T> &tile_values, int n_tx, int n_ty,
                        int tile_size, int width, int height, double x,
                        double y) {
-  // Locate the two tile-center rows/cols straddling (x,y).
-  double ix = -1.0, iy = -1.0;
-  int tx0 = 0, tx1 = 0, ty0 = 0, ty1 = 0;
-  // Find tx0 such that tile_center(tx0) <= x < tile_center(tx0+1).
-  // Tile centers are monotonically increasing.
-  for (int tx = 0; tx < n_tx; ++tx) {
-    double c = tile_center(tx, tile_size, width);
-    if (c <= x) {
-      tx0 = tx;
-      ix = c;
-    } else {
-      break;
-    }
-  }
-  tx1 = std::min(tx0 + 1, n_tx - 1);
-  double ix1 = tile_center(tx1, tile_size, width);
+  const double half_minus = 0.5 * (tile_size - 1);
+  int tx0 = static_cast<int>(std::floor((x - half_minus) / tile_size));
+  int ty0 = static_cast<int>(std::floor((y - half_minus) / tile_size));
+  tx0 = std::clamp(tx0, 0, n_tx - 1);
+  ty0 = std::clamp(ty0, 0, n_ty - 1);
+  int tx1 = std::min(tx0 + 1, n_tx - 1);
+  int ty1 = std::min(ty0 + 1, n_ty - 1);
 
-  for (int ty = 0; ty < n_ty; ++ty) {
-    double c = tile_center(ty, tile_size, height);
-    if (c <= y) {
-      ty0 = ty;
-      iy = c;
-    } else {
-      break;
-    }
-  }
-  ty1 = std::min(ty0 + 1, n_ty - 1);
+  // Exact centers (handles the smaller last tile when width % tile_size != 0).
+  double ix = tile_center(tx0, tile_size, width);
+  double ix1 = tile_center(tx1, tile_size, width);
+  double iy = tile_center(ty0, tile_size, height);
   double iy1 = tile_center(ty1, tile_size, height);
+
+  // If the computed tx0 sits to the right of x (pixel is left of the very
+  // first tile center, or last-tile center shift overshot), step back one.
+  // Guarantees ix <= x for the weight formula below.
+  if (ix > x && tx0 > 0) {
+    --tx0;
+    tx1 = tx0 + 1;
+    ix = tile_center(tx0, tile_size, width);
+    ix1 = tile_center(tx1, tile_size, width);
+  }
+  if (iy > y && ty0 > 0) {
+    --ty0;
+    ty1 = ty0 + 1;
+    iy = tile_center(ty0, tile_size, height);
+    iy1 = tile_center(ty1, tile_size, height);
+  }
 
   // Compute interpolation weights. Guard against degenerate (single-tile or
   // edge) cases where ix == ix1 or iy == iy1.
