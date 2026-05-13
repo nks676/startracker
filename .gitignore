@@ -1,5 +1,8 @@
-# Build output
-build/
+# Build output (build/, build-arm64/ from cross-compile diagnosis, etc.)
+build*/
+
+# Claude Code project state
+.claude/
 
 # Generated data at the repo root (reproducible via tools/).
 # Anchored so tests/data/ (committed test fixtures) is unaffected.
