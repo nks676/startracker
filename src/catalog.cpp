@@ -378,20 +378,36 @@ std::vector<int> StarDatabase::find_partners(int hip, double cos_target,
 
 std::vector<CatalogPair> StarDatabase::find_pairs(double cos_target,
                                                   double cos_tolerance) const {
-  // Array is sorted descending by cos_val (meaning closest pairs first)
-  // We want cos_val in [cos_target - cos_tolerance, cos_target + cos_tolerance]
-
-  // upper_bound/lower_bound requires binary search logic adapted for descending
-  // order
-  auto comp = [](const CatalogPair &p, double val) {
-    return p.cos_val > val; // descending
+  // Array is sorted descending by cos_val (closest pairs first). We want
+  // cos_val in the CLOSED interval [cos_target - tol, cos_target + tol].
+  //
+  // Pre-3f.x bug: both endpoints used std::lower_bound with the same
+  // descending comparator, which gave (cos_low, cos_high] — the bottom
+  // endpoint was EXCLUSIVE. Visible only when tol=0 (the only case where
+  // the open vs closed bottom matters in practice): a pair exactly at
+  // cos_target would be reported by find_pairs_kvec but NOT find_pairs,
+  // and CatalogTest.KVectorEdgeCases failed on its zero-tolerance probe
+  // (line 261). Production runs always use tol > 0, so the bug didn't
+  // affect identify-stage correctness, but the two implementations should
+  // agree at all tolerances.
+  //
+  // Fix: use lower_bound for the top boundary (cos_val <= cos_high),
+  // upper_bound for the bottom (cos_val < cos_low is past the boundary,
+  // so pairs at exactly cos_low are included). Now both ends are closed,
+  // matching find_pairs_kvec's [cos_low, cos_high] trim.
+  auto comp_lower = [](const CatalogPair &p, double val) {
+    return p.cos_val > val; // descending: front of partition is "true"
+  };
+  auto comp_upper = [](double val, const CatalogPair &p) {
+    return val > p.cos_val; // descending: first iter where val > p.cos_val
   };
 
   const CatalogPair *begin = pairs_ptr_;
   const CatalogPair *end = pairs_ptr_ + pairs_count_;
   auto it_begin =
-      std::lower_bound(begin, end, cos_target + cos_tolerance, comp);
-  auto it_end = std::lower_bound(begin, end, cos_target - cos_tolerance, comp);
+      std::lower_bound(begin, end, cos_target + cos_tolerance, comp_lower);
+  auto it_end =
+      std::upper_bound(begin, end, cos_target - cos_tolerance, comp_upper);
 
   return std::vector<CatalogPair>(it_begin, it_end);
 }
